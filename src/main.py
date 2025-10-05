@@ -1,7 +1,5 @@
 import dataclasses
 import os
-import warnings
-import contextlib
 
 import moderngl as mgl
 import numpy as np
@@ -14,25 +12,7 @@ class MilRendererConfig:
     input_path: str
     video_path: str
 
-class MilRendererException(Exception):
-    pass
-
-class FuckUserException:
-    def __new__(cls, *args, **kwargs):
-        if args and "fuck user" in args:
-            args = args[1:]
-
-        return MilRendererException(*args, **kwargs)
-
-FuckUserWarnning = type("MilRendererWarnning", (Warning, ), {})
-
 class MilRenderer:
-    @contextlib.contextmanager
-    def _internal_context(self):
-        self._internal_call = True
-        yield
-        self._internal_call = False
-
     def __init__(self):
         try:
             self.ctx = mgl.create_context(standalone=True)
@@ -42,8 +22,7 @@ class MilRenderer:
             else:
                 raise RuntimeError("Failed to create rendering context") from e
         
-        with self._internal_context():
-            self._initialized = False
+        self._initialized = False
         
     def initialize(self, cfg: MilRendererConfig):
         if self._initialized:
@@ -53,25 +32,25 @@ class MilRenderer:
             raise ValueError(f"Invalid config type: {type(cfg)}")
         
         try:
-            ctx.width = float(cfg.width)
-            ctx.height = float(cfg.height)
+            cfg.width = float(cfg.width)
+            cfg.height = float(cfg.height)
 
-            if not ctx.width.is_integer() or not ctx.height.is_integer():
-                raise FuckUserException("fuck user", "size must be integer")
+            if not cfg.width.is_integer() or not cfg.height.is_integer():
+                raise Exception("size must be integer")
             
-            ctx.width = int(ctx.width)
-            ctx.height = int(ctx.height)
+            cfg.width = int(cfg.width)
+            cfg.height = int(cfg.height)
 
-            if ctx.width <= 0 or ctx.height <= 0:
-                raise FuckUserException("fuck user", "size must be positive")
+            if cfg.width <= 0 or cfg.height <= 0:
+                raise Exception("size must be positive")
         except Exception as e:
             raise ValueError(f"Invalid resolution: {cfg.width}x{cfg.height}") from e
         
         try:
-            ctx.fps = float(cfg.fps)
+            cfg.fps = float(cfg.fps)
             
-            if ctx.fps <= 0.0:
-                raise FuckUserException("fuck user", "fps must be positive")
+            if cfg.fps <= 0.0:
+                raise Exception("fps must be positive")
         except Exception as e:
             raise ValueError(f"Invalid fps: {cfg.fps}") from e
         
@@ -88,16 +67,10 @@ class MilRenderer:
             raise ValueError(f"Invalid video path: {cfg.video_path} is already exists")
 
         self.ctx.viewport = (0, 0, cfg.width, cfg.height)
-
-        with self._internal_context():
-            self._initialized = True
+        self._initialized = True
     
     def run(self):
         pass
-    
-    def __setattr__(self, name, value):
-        if name.startswith("_") and not self._internal_call:
-            warnings.warn(f"Accessing private attribute {name} is not allowed", FuckUserWarnning)
     
 if __name__ == "__main__":
     import argparse
@@ -105,12 +78,14 @@ if __name__ == "__main__":
     aparser = argparse.ArgumentParser()
     aparser.add_argument("-i", "--input", type=str, required=True)
     aparser.add_argument("-o", "--output", type=str, required=True)
-    aparser.add_argument("-s-w", "--width", type=int, default=1920, required=True)
-    aparser.add_argument("-s-h", "--height", type=int, default=1080, required=True)
-    aparser.add_argument("-f", "--fps", type=float, default=60.0, required=True)
+    aparser.add_argument("-s-w", "--width", type=int, default=1920)
+    aparser.add_argument("-s-h", "--height", type=int, default=1080)
+    aparser.add_argument("-f", "--fps", type=float, default=60.0)
 
     args = aparser.parse_args()
-    renderer = MilRenderer(MilRendererConfig(
+    renderer = MilRenderer()
+    
+    renderer.initialize(MilRendererConfig(
         width = args.width,
         height = args.height,
         fps = args.fps,
