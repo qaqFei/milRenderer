@@ -1,8 +1,26 @@
 import dataclasses
 import os
+import zipfile
+import typing
+import logging
+import io
 
 import moderngl as mgl
 import numpy as np
+import av
+
+__all__ = (
+    "MilRendererConfig",
+    "MilRenderer"
+)
+
+logging.basicConfig(
+    level = logging.INFO if not os.environ.get("DEBUG") else logging.DEBUG,
+    format = "[%(asctime)s] %(levelname)s %(funcName)s: %(message)s",
+    datefmt = "%H:%M:%S"
+)
+
+logger = logging.getLogger(__name__)
 
 @dataclasses.dataclass
 class MilRendererConfig:
@@ -12,6 +30,56 @@ class MilRendererConfig:
     input_path: str
     video_path: str
 
+def _normZipPath(path: str) -> str:
+    path = path.replace("\\", "/")
+    while "//" in path:
+        path = path.replace("//", "/")
+    
+    if path and path[0] == "/":
+        path = path[1:]
+
+    return path
+
+def _hasZipFile(zip: zipfile.ZipFile, path: str) -> bool:
+    path = _normZipPath(path)
+    for f in zip.infolist():
+        if f.filename == path:
+            return True
+    return False
+
+def _readZipFileAs(zip: zipfile.ZipFile, path: str, dtype: typing.Literal["bytes", "str", "json"]):
+    path = _normZipPath(path)
+    data = zip.read(path)
+
+    match dtype:
+        case "bytes":
+            return data
+
+        case "str":
+            return data.decode("utf-8")
+        
+        case "json":
+            return json.loads(data)
+        
+        case _:
+            raise ValueError(f"Invalid dtype: {dtype}")
+
+def _decodeAudioBytes(data: bytes) -> np.ndarray:
+    warpped = io.BytesIO(data)
+
+    resampler = av.AudioResampler(format="s16", layout="stereo", rate=44100)
+
+    pcm_chunks = []
+    with av.open(warpped) as cont:
+        for frame in cont.decode(audio=0):
+            frame.pts = None
+            rframe = resampler.resample(frame)
+            if rframe is not None:
+                pcm_chunks.append(rframe.to_ndarray())   # (C, S)
+
+    pcm = np.concatenate(pcm_chunks, axis=1)  # (C, S)
+    return pcm.astype(np.int16)
+
 class MilRenderer:
     def __init__(self):
         try:
@@ -19,8 +87,12 @@ class MilRenderer:
         except Exception as e:
             if "XOpenDisplay" in repr(e):
                 self.ctx = mgl.create_context(standalone=True, backend="egl")
+                logger.info("created rendering context with egl backend")
             else:
                 raise RuntimeError("Failed to create rendering context") from e
+
+        logger.info("created rendering context")
+        logger.debug(f"rendering context info: {self.ctx.info}")
         
         self._initialized = False
         
@@ -67,10 +139,30 @@ class MilRenderer:
             raise ValueError(f"Invalid video path: {cfg.video_path} is already exists")
 
         self.ctx.viewport = (0, 0, cfg.width, cfg.height)
+        logger.info(f"set context viewport to {cfg.width}x{cfg.height}")
         self._initialized = True
     
     def run(self):
-        pass
+        try:
+            chartZip = zipfile.ZipFile(cfg.input_path)
+            logger.debug(f"opened chart zip file: {cfg.input_path}")
+            meta = _readZipFileAs(chartZip, "/meta.json", "json")
+            logger.debug(f"read meta.json: {meta}")
+
+            if not isinstance(meta, dict):
+                raise Exception("meta.json is not a dict")
+            
+            chartJson = _readZipFileAs(chartZip, meta["chartFile"], "json")
+            audioBytes = _readZipFileAs(chartZip, meta["audioFile"], "bytes")
+            imageBytes = _readZipFileAs(chartZip, meta["imageFile"], "bytes")
+
+            if not isinstance(chartJson, dict):
+                raise Exception("chart.json is not a dict")
+            
+            logger.info("decoding audio")
+            decoededAudio = _decodeAudioBytes(audioBytes)
+        except Exception as e:
+            raise ValueError(f"Invalid input path: {cfg.input_path} is not a zip file") from e
     
 if __name__ == "__main__":
     import argparse
