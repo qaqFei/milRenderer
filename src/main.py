@@ -7,6 +7,8 @@ import typing
 import logging
 import io
 import json
+import struct
+import time
 
 import moderngl as mgl
 import numpy as np
@@ -50,6 +52,13 @@ logger.debug(f"{HOLD_DISAPPEAR_TIME=}, {FLOW_SPEED=}")
 logger.debug(f"{HOLD_SPWAN_HIT_EFFECT_SEP=}, {HIT_EFFECT_DUR=}")
 logger.debug(f"{HITEFFECT_SIZE=}")
 logger.debug(f"{HITEFFECT_PREPARE_GROUP_NUM=}")
+
+AUDIO_SAMPLE_RATE = 44100
+AUDIO_LAYOUT = "stereo"
+logger.debug(f"{AUDIO_SAMPLE_RATE=}, {AUDIO_LAYOUT=}")
+
+RES_PATH = "./res"
+logger.debug(f"{RES_PATH=}")
 
 MIL_EASINGS: list[list[typing.Callable[[float], float]]] = [
     [
@@ -589,8 +598,7 @@ def _readZipFileAs(zip: zipfile.ZipFile, path: str, dtype: typing.Literal["bytes
 
 def _decodeAudioBytes(data: bytes) -> np.ndarray:
     wrapped = io.BytesIO(data)
-
-    resampler = av.AudioResampler(format="s16", layout="stereo", rate=44100)
+    resampler = av.AudioResampler(format="s16", layout=AUDIO_LAYOUT, rate=AUDIO_SAMPLE_RATE)
 
     pcm_chunks = []
     with av.open(wrapped) as cont:
@@ -598,14 +606,111 @@ def _decodeAudioBytes(data: bytes) -> np.ndarray:
             frame.pts = None
             for rframe in resampler.resample(frame):
                 if rframe.samples > 0:
-                    pcm_chunks.append(rframe.to_ndarray())
+                    pcm_chunks.append(rframe.to_ndarray()[0])
 
     if not pcm_chunks: 
-        return np.empty((2, 0), dtype=np.int16)
+        return np.empty((2, ), dtype=np.int16)
 
-    pcm = np.concatenate(pcm_chunks, axis=1)
-    return pcm.astype(np.int16)
+    return np.concatenate(pcm_chunks).astype(np.int32)
 
+def _decodeAudioFromFile(path: str) -> np.ndarray:
+    with open(path, "rb") as f:
+        return _decodeAudioBytes(f.read())
+
+def _decodeImageBytes(data: bytes) -> WarppedImage:
+    warpped = io.BytesIO(data)
+    
+    with av.open(warpped) as cont:
+        for frame in cont.decode(video=0):
+            frame.pts = None
+            return WarppedImage(frame.to_ndarray(), frame.format.bits_per_pixel == 32)
+        else:
+            raise ValueError("No frame found")
+
+def _decodeImageFromFile(path: str) -> WarppedImage:
+    with open(path, "rb") as f:
+        return _decodeImageBytes(f.read())
+
+def _get_channels_from_layout(layout: str):
+    match layout:
+        case "mono":
+            return 1
+            
+        case "stereo":
+            return 2
+        
+        case _:
+            raise ValueError(f"Invalid layout: {layout}")
+            
+def _overlay_audio(target: np.ndarray, source: np.ndarray, t: float) -> None:
+    channels = _get_channels_from_layout(AUDIO_LAYOUT)
+    t = int(t * AUDIO_SAMPLE_RATE) * channels
+
+    if len(target) <= t or t <= -len(source):
+        return
+    
+    if t + len(source) > len(target):
+        source = source[:len(target) - t]
+    
+    target[t:t + len(source)] += source
+
+def _export_audio(audio: np.ndarray, path: str) -> None:
+    channels = _get_channels_from_layout(AUDIO_LAYOUT)
+    audio = audio.clip(-32768, 32767).astype(np.int16)
+    with open(path, "wb") as f:
+        f.write(b"RIFF")
+        f.write(struct.pack("<I", 36 + len(audio) * 2))
+        f.write(b"WAVE")
+        f.write(b"fmt ")
+        f.write(struct.pack("<I", 0x10))
+        f.write(struct.pack("<H", 1)) # PCM
+        f.write(struct.pack("<H", channels))
+        f.write(struct.pack("<I", AUDIO_SAMPLE_RATE))
+        f.write(struct.pack("<I", AUDIO_SAMPLE_RATE * channels * 2))
+        f.write(struct.pack("<H", channels * 2))
+        f.write(struct.pack("<H", 2 * 8))
+        f.write(b"data")
+        f.write(audio.tobytes())
+
+@dataclasses.dataclass
+class WarppedImage:
+    data: np.ndarray
+    alpha: bool
+
+class MilResourceLoader:
+    def __init__(self):
+        self.res = {}
+
+        for name in ("tap", "drag", "hold"):
+            self.res[f"{name}"] = _decodeImageFromFile(self.get_res_path(f"{name}.png"))
+            self.res[f"{name}_double"] = _decodeImageFromFile(self.get_res_path(f"{name}_double.png"))
+            
+            if name != "drag":
+                self.res[f"ex{name}"] = _decodeImageFromFile(self.get_res_path(f"ex{name}.png"))
+                self.res[f"ex{name}_double"] = _decodeImageFromFile(self.get_res_path(f"ex{name}_double.png"))
+
+            logger.debug(f"loaded note texture {name}")
+        
+        self.res["clicksound"] = {
+            "hit": _decodeAudioFromFile(self.get_res_path("hit.ogg")),
+            "drag": _decodeAudioFromFile(self.get_res_path("drag.ogg")),
+        }
+    
+    @staticmethod
+    def get_res_path(name: str):
+        return os.path.join(RES_PATH, name)
+    
+    def clicksound_from_type(self, typ: int):
+        match typ:
+            case EnumNoteType.Hit:
+                return self.res["clicksound"]["hit"]
+            
+            case EnumNoteType.Drag:
+                return self.res["clicksound"]["drag"]
+
+            case _:
+                raise ValueError(f"Invalid note type: {typ}")
+    
 class MilRenderer:
     def __init__(self):
         try:
@@ -667,6 +772,10 @@ class MilRenderer:
         self.ctx.viewport = (0, 0, cfg.width, cfg.height)
         logger.info(f"set context viewport to {cfg.width}x{cfg.height}")
         self.cfg = cfg
+        self.resloader = MilResourceLoader()
+
+        logger.info("loading resouces")
+
         self._initialized = True
     
     def run(self):
@@ -704,8 +813,14 @@ class MilRenderer:
             
             logger.debug(f"collected {len(collected_notetimes)} notes to mix audio")
 
+            mixing_st = time.perf_counter()
             for note_type, note_time in collected_notetimes:
-                pass
+                _overlay_audio(decoededAudio, self.resloader.clicksound_from_type(note_type), note_time)
+            mixing_et = time.perf_counter()
+            logger.info(f"audio mixing took {mixing_et - mixing_st:.5f} s, {len(collected_notetimes) / (mixing_et - mixing_st)}note/s")
+            
+            if os.environ.get("DEBUG_EXPORT_MIXED_AUDIO"):
+                _export_audio(decoededAudio, "debug_created_mixed_audio.wav")
         except Exception as e:
             raise ValueError(f"Invalid input path: {self.cfg.input_path} is not a zip file") from e
     
