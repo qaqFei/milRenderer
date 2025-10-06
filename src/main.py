@@ -13,6 +13,7 @@ import time
 import moderngl as mgl
 import numpy as np
 import av
+import tqdm
 
 __all__ = (
     "MilRendererConfig",
@@ -53,7 +54,7 @@ logger.debug(f"{HOLD_SPWAN_HIT_EFFECT_SEP=}, {HIT_EFFECT_DUR=}")
 logger.debug(f"{HITEFFECT_SIZE=}")
 logger.debug(f"{HITEFFECT_PREPARE_GROUP_NUM=}")
 
-AUDIO_SAMPLE_RATE = 44100
+AUDIO_SAMPLE_RATE = 16000
 AUDIO_LAYOUT = "stereo"
 logger.debug(f"{AUDIO_SAMPLE_RATE=}, {AUDIO_LAYOUT=}")
 
@@ -631,6 +632,9 @@ def _decodeImageFromFile(path: str) -> WarppedImage:
     with open(path, "rb") as f:
         return _decodeImageBytes(f.read())
 
+def _get_audio_dur(audio: np.ndarray) -> float:
+    return len(audio) / AUDIO_SAMPLE_RATE / _get_channels_from_layout(AUDIO_LAYOUT)
+
 def _get_channels_from_layout(layout: str):
     match layout:
         case "mono":
@@ -654,9 +658,12 @@ def _overlay_audio(target: np.ndarray, source: np.ndarray, t: float) -> None:
     
     target[t:t + len(source)] += source
 
+def _audio_to_s16(audio: np.ndarray) -> np.ndarray:
+    return audio.clip(-32768, 32767).astype(np.int16)
+
 def _export_audio(audio: np.ndarray, path: str) -> None:
     channels = _get_channels_from_layout(AUDIO_LAYOUT)
-    audio = audio.clip(-32768, 32767).astype(np.int16)
+    audio = _audio_to_s16(audio)
     with open(path, "wb") as f:
         f.write(b"RIFF")
         f.write(struct.pack("<I", 36 + len(audio) * 2))
@@ -671,6 +678,20 @@ def _export_audio(audio: np.ndarray, path: str) -> None:
         f.write(struct.pack("<H", 2 * 8))
         f.write(b"data")
         f.write(audio.tobytes())
+
+def _createAudioFrames(audio: np.ndarray) -> list[av.AudioFrame]:
+    audio = _audio_to_s16(audio)
+    frames = []
+    frame_size = 1024
+    channels = _get_channels_from_layout(AUDIO_LAYOUT)
+
+    for i in range(0, len(audio), frame_size):
+        frame = av.AudioFrame.from_ndarray(audio[i:i+frame_size].reshape((1, -1)), format="s16", layout=AUDIO_LAYOUT)
+        # frame.pts = i * frame_size / AUDIO_SAMPLE_RATE * 1000
+        frame.sample_rate = AUDIO_SAMPLE_RATE
+        frames.append(frame)
+    
+    return frames
 
 @dataclasses.dataclass
 class WarppedImage:
@@ -751,8 +772,13 @@ class MilRenderer:
         
         try:
             cfg.fps = float(cfg.fps)
+
+            if not cfg.fps.is_integer():
+                raise Exception("fps must be integer")
             
-            if cfg.fps <= 0.0:
+            cfg.fps = int(cfg.fps)
+            
+            if cfg.fps <= 0:
                 raise Exception("fps must be positive")
         except Exception as e:
             raise ValueError(f"Invalid fps: {cfg.fps}") from e
@@ -800,7 +826,10 @@ class MilRenderer:
 
             logger.info("loading chart")
             chart = MilChart(chartJson)
-
+        except Exception as e:
+            raise RuntimeError(f"Failed to read files of chart: {e}") from e
+        
+        try:
             logger.info("mixing audio")
             collected_notetimes = []
 
@@ -822,8 +851,55 @@ class MilRenderer:
             if os.environ.get("DEBUG_EXPORT_MIXED_AUDIO"):
                 _export_audio(decoededAudio, "debug_created_mixed_audio.wav")
         except Exception as e:
-            raise ValueError(f"Invalid input path: {self.cfg.input_path} is not a zip file") from e
+            raise RuntimeError(f"Failed to mix audio: {e}") from e
+        
+        try:
+            v_cont = av.open(self.cfg.video_path, "w")
+            v_stream = v_cont.add_stream("h264", rate=self.cfg.fps)
+            v_stream.width, v_stream.height = self.cfg.width, self.cfg.height
+            v_stream.pix_fmt = "yuv420p"
+            a_stream = v_cont.add_stream("aac", rate=AUDIO_SAMPLE_RATE, layout=AUDIO_LAYOUT)
+        except Exception as e:
+            raise RuntimeError(f"Failed to open output stream: {e}") from e
+        
+        try:
+            audio_frames = _createAudioFrames(decoededAudio)
+            
+            for frame in tqdm.tqdm(audio_frames, desc="encoding audio"):
+                packets = a_stream.encode(frame)
+                for packet in packets:
+                    v_cont.mux(packet)
+        except Exception as e:
+            raise RuntimeError(f"Failed to write audio stream: {e}") from e
+        
+        t = 0.0
+        duration = _get_audio_dur(decoededAudio)
+        frame_duration = 1.0 / self.cfg.fps
+        num_frames = int(duration // frame_duration) + 1
+
+        buffer = self.ctx.simple_framebuffer((self.cfg.width, self.cfg.height))
+        buffer.use()
+        for i in tqdm.trange(num_frames, desc="rendering frames"):
+            t = i * frame_duration
+
+            self._render_chart(chart, t)
+
+            pixels = np.frombuffer(buffer.read(components=3, dtype="u1"), dtype=np.uint8).reshape((self.cfg.height, self.cfg.width, 3)).transpose(1, 0, 2)
+            buffer.clear()
+            
+            frame = av.VideoFrame.from_ndarray(pixels, format="rgb24")
+            packets = v_stream.encode(frame)
+            for packet in packets:
+                v_cont.mux(packet)
+
+        try:
+            v_cont.close()
+        except Exception as e:
+            raise RuntimeError(f"Failed to close output stream: {e}") from e
     
+    def _render_chart(self, chart: MilChart, t: float):
+        pass
+        
 if __name__ == "__main__":
     import argparse
 
@@ -832,11 +908,18 @@ if __name__ == "__main__":
     aparser.add_argument("-o", "--output", type=str, required=True)
     aparser.add_argument("-s-w", "--width", type=int, default=1920)
     aparser.add_argument("-s-h", "--height", type=int, default=1080)
-    aparser.add_argument("-f", "--fps", type=float, default=60.0)
+    aparser.add_argument("-f", "--fps", type=int, default=60)
+    aparser.add_argument("-y", "--yes", action="store_true", default=False)
 
     args = aparser.parse_args()
+
+    if os.path.isfile(args.output):
+        if not args.yes and input(f"{args.output} is exists, are you sure to continue? [y/N] ").lower() != "y":
+            argparse.exit(1, "aborting by user")
+        
+        os.remove(args.output)
+
     renderer = MilRenderer()
-    
     renderer.initialize(MilRendererConfig(
         width = args.width,
         height = args.height,
