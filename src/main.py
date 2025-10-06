@@ -4,6 +4,7 @@ import zipfile
 import typing
 import logging
 import io
+import json
 
 import moderngl as mgl
 import numpy as np
@@ -21,6 +22,7 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+logger.debug("log level: debug")
 
 @dataclasses.dataclass
 class MilRendererConfig:
@@ -65,19 +67,22 @@ def _readZipFileAs(zip: zipfile.ZipFile, path: str, dtype: typing.Literal["bytes
             raise ValueError(f"Invalid dtype: {dtype}")
 
 def _decodeAudioBytes(data: bytes) -> np.ndarray:
-    warpped = io.BytesIO(data)
+    wrapped = io.BytesIO(data)
 
     resampler = av.AudioResampler(format="s16", layout="stereo", rate=44100)
 
     pcm_chunks = []
-    with av.open(warpped) as cont:
+    with av.open(wrapped) as cont:
         for frame in cont.decode(audio=0):
             frame.pts = None
-            rframe = resampler.resample(frame)
-            if rframe is not None:
-                pcm_chunks.append(rframe.to_ndarray())   # (C, S)
+            for rframe in resampler.resample(frame):
+                if rframe.samples > 0:
+                    pcm_chunks.append(rframe.to_ndarray())
 
-    pcm = np.concatenate(pcm_chunks, axis=1)  # (C, S)
+    if not pcm_chunks: 
+        return np.empty((2, 0), dtype=np.int16)
+
+    pcm = np.concatenate(pcm_chunks, axis=1)
     return pcm.astype(np.int16)
 
 class MilRenderer:
@@ -140,21 +145,22 @@ class MilRenderer:
 
         self.ctx.viewport = (0, 0, cfg.width, cfg.height)
         logger.info(f"set context viewport to {cfg.width}x{cfg.height}")
+        self.cfg = cfg
         self._initialized = True
     
     def run(self):
         try:
-            chartZip = zipfile.ZipFile(cfg.input_path)
-            logger.debug(f"opened chart zip file: {cfg.input_path}")
+            chartZip = zipfile.ZipFile(self.cfg.input_path)
+            logger.debug(f"opened chart zip file: {self.cfg.input_path}")
             meta = _readZipFileAs(chartZip, "/meta.json", "json")
             logger.debug(f"read meta.json: {meta}")
 
             if not isinstance(meta, dict):
                 raise Exception("meta.json is not a dict")
             
-            chartJson = _readZipFileAs(chartZip, meta["chartFile"], "json")
-            audioBytes = _readZipFileAs(chartZip, meta["audioFile"], "bytes")
-            imageBytes = _readZipFileAs(chartZip, meta["imageFile"], "bytes")
+            chartJson = _readZipFileAs(chartZip, meta["chart_file"], "json")
+            audioBytes = _readZipFileAs(chartZip, meta["audio_file"], "bytes")
+            imageBytes = _readZipFileAs(chartZip, meta["image_file"], "bytes")
 
             if not isinstance(chartJson, dict):
                 raise Exception("chart.json is not a dict")
@@ -162,7 +168,7 @@ class MilRenderer:
             logger.info("decoding audio")
             decoededAudio = _decodeAudioBytes(audioBytes)
         except Exception as e:
-            raise ValueError(f"Invalid input path: {cfg.input_path} is not a zip file") from e
+            raise ValueError(f"Invalid input path: {self.cfg.input_path} is not a zip file") from e
     
 if __name__ == "__main__":
     import argparse
