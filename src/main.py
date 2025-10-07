@@ -765,11 +765,15 @@ def _export_audio(audio: np.ndarray, path: str) -> None:
 class GlProgManager:
     def __init__(self, ctx: moderngl.Context):
         self.ctx = ctx
-        self.progs = {}
+        self.progs: dict[str, moderngl.Program] = {}
+        self.verts = np.zeros(65536, dtype=[("pos", np.float32, 2), ("uv", np.float32, 2)])
+        self.vbo = self.ctx.buffer(self.verts)
+        self.vaos: dict[str, moderngl.VertexArray] = {}
     
     def add_from_shader(self, name: str, vertex_shader: str, fragment_shader: str):
         prog = self.ctx.program(vertex_shader, fragment_shader)
         self.progs[name] = prog
+        logger.debug(f"added gl program {name}")
         return prog
     
     def add_from_file(self, name: str, vertex_shader_path: str, fragment_shader_path: str):
@@ -780,6 +784,38 @@ class GlProgManager:
             fragment_shader = f.read()
             
         return self.add_from_shader(name, vertex_shader, fragment_shader)
+    
+    def add_from_folder(self, name: str):
+        self.add_from_file(name, f"./res/glprogs/{name}/v.glsl", f"./res/glprogs/{name}/f.glsl")
+    
+    def p_simple_texture(self, tex: moderngl.Texture, x: float, y: float, w: float, h: float):
+        progn = "simple_texture"
+        prog = self[progn]
+
+        if progn not in self.vaos:
+            vao = self.ctx.vertex_array(prog, [(self.vbo, "2f 2f", "a_pos", "a_uv")])
+            self.vaos[progn] = vao
+        else:
+            vao = self.vaos[progn]
+
+        x1, y1 = x, y
+        x2, y2 = x + w, y + h
+        vs = np.array([
+            (x1, y1, 0, 0),
+            (x2, y1, 1, 0),
+            (x2, y2, 1, 1),
+            (x1, y1, 0, 0),
+            (x2, y2, 1, 1),
+            (x1, y2, 0, 1),
+        ], dtype=[("pos", "2f"), ("uv", "2f")])
+
+        self.vbo.write(vs.tobytes())
+
+        prog["u_tex"] = 0
+        tex.use(0)
+        prog["u_vp"] = tex.ctx.screen.size
+
+        vao.render(mgl.TRIANGLES, first=0, vertices=6)
     
     def __getitem__(self, name: str):
         return self.progs[name]
@@ -896,6 +932,7 @@ class MilRenderer:
 
         logger.info("loading gl programs")
         self.glpman = GlProgManager(self.ctx)
+        self.glpman.add_from_folder("simple_texture")
 
         self._initialized = True
     
