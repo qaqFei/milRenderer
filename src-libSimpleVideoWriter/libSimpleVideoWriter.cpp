@@ -172,11 +172,11 @@ void ReleaseVideoContext(VideoContext* ctx) {
 
 #define _STR(x) #x
 #define STR(x)  _STR(x)
-#pragma message("__AVX2__ = " STR(__AVX2__))
-#pragma message("__FMA__  = " STR(__FMA__))
-#pragma message("_OPENMP  = " STR(_OPENMP))
+// #pragma message("__AVX2__ = " STR(__AVX2__))
+// #pragma message("__FMA__  = " STR(__FMA__))
+// #pragma message("_OPENMP  = " STR(_OPENMP))
 
-#if defined(__AVX2__) && defined(__FMA__) && defined(_OPENMP)
+#if defined(__AVX2__) && defined(__FMA__) && defined(_OPENMP) && 0 // has bugs
 #   define HAS_AVX2_RGB24_TO_YUV420 1
 #   include <immintrin.h>
 #   include <omp.h>
@@ -365,28 +365,24 @@ void PutFrame(VideoContext* ctx, iu8* rgbBuffer, i64 width, i64 height) {
         ctx->swsCtx = sws_getContext(
             width, height, AV_PIX_FMT_RGB24,
             width, height, AV_PIX_FMT_YUV420P,
-            SWS_BILINEAR, nullptr, nullptr, nullptr
+            SWS_FAST_BILINEAR, nullptr, nullptr, nullptr
         );
     }
 
     AVFrame* rgbFrame = av_frame_alloc();
     av_image_alloc(rgbFrame->data, rgbFrame->linesize, width, height, AV_PIX_FMT_RGB24, 1);
 
-    auto t0 = std::chrono::high_resolution_clock::now();
     for (int y = 0; y < height; ++y) {
         memcpy(rgbFrame->data[0] + y * rgbFrame->linesize[0], rgbBuffer + y * width * 3, width * 3);
     }
-    auto t1 = std::chrono::high_resolution_clock::now();
-    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    // printf("[PutFrame] memcpy: %fms\n", ms);
 
-    t0 = std::chrono::high_resolution_clock::now();
+    auto t0 = std::chrono::high_resolution_clock::now();
 
     if (HAS_AVX2_RGB24_TO_YUV420) rgb24_to_yuv420_avx2(rgbBuffer, width, height, ctx->frame->data[0], ctx->frame->data[1], ctx->frame->data[2]);
     else sws_scale(ctx->swsCtx, (const iu8* const*)rgbFrame->data, rgbFrame->linesize, 0, height, ctx->frame->data, ctx->frame->linesize);
 
-    t1 = std::chrono::high_resolution_clock::now();
-    ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    auto t1 = std::chrono::high_resolution_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     // printf("[PutFrame] sws_scale: %fms\n", ms);
 
     ctx->frame->pts = ctx->frameIndex++;
