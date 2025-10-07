@@ -205,14 +205,12 @@ class _VideoWriter:
         if not res:
             raise RuntimeError("InitializeVideoContext failed")
     
-    def write_frame(self, rgbFrame: np.ndarray, width: int, height: int):
+    def write_frame(self, rgbFrame: bytes, width: int, height: int):
         PutFrame = self._lib.PutFrame
         PutFrame.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long, ctypes.c_long)
         PutFrame.restype = None
-
-        rgbFrame = np.ascontiguousarray(rgbFrame)
         
-        PutFrame(self._ptr, rgbFrame.ctypes.data, width, height)
+        PutFrame(self._ptr, rgbFrame, width, height)
 
     def release(self):
         ReleaseVideoContext = self._lib.ReleaseVideoContext
@@ -935,6 +933,9 @@ class MilRenderer:
             if self.cfg.a_codec not in a_codecs:
                 raise Exception(f"unsupported audio codec: {self.cfg.a_codec}")
             
+            logger.info(f"using video codec: {self.cfg.v_codec}")
+            logger.info(f"using audio codec: {self.cfg.a_codec}")
+            
             v_writer.initialize(self.cfg.video_path, self.cfg.v_codec, self.cfg.a_codec, decoededAudio)
         except Exception as e:
             raise RuntimeError(f"Failed to initialize output stream: {e}") from e
@@ -950,13 +951,14 @@ class MilRenderer:
 
         buffer = self.ctx.simple_framebuffer((self.cfg.width, self.cfg.height))
         buffer.use()
+        pixels = buffer.read(components=3, dtype="u1")
+        pixels = b"\x12\x23\x34" * 1920 * 1080
         for i in tqdm.trange(num_frames, desc="rendering frames"):
-            t = i * frame_duration
+            # t = i * frame_duration
 
-            self._render_chart(chart, t)
+            # self._render_chart(chart, t)
 
-            pixels = np.frombuffer(buffer.read(components=3, dtype="u1"), dtype=np.uint8)
-            buffer.clear()
+            # buffer.clear()
 
             v_writer.write_frame(pixels, self.cfg.width, self.cfg.height)
 

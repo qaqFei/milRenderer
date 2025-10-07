@@ -169,6 +169,195 @@ void ReleaseVideoContext(VideoContext* ctx) {
     ctx->swsCtx = nullptr;
 }
 
+
+#define _STR(x) #x
+#define STR(x)  _STR(x)
+#pragma message("__AVX2__ = " STR(__AVX2__))
+#pragma message("__FMA__  = " STR(__FMA__))
+#pragma message("_OPENMP  = " STR(_OPENMP))
+
+#if defined(__AVX2__) && defined(__FMA__) && defined(_OPENMP)
+#   define HAS_AVX2_RGB24_TO_YUV420 1
+#   include <immintrin.h>
+#   include <omp.h>
+#   pragma message("HAS_AVX2_RGB24_TO_YUV420 = 1")
+
+static inline int align16(int x) { return x & ~15; }
+void rgb24_to_yuv420_avx2(const uint8_t* rgb, int w, int h, uint8_t* y, uint8_t* u, uint8_t* v) {
+    const int strideY = w;
+    const int strideUV = w >> 1;
+
+    #pragma omp parallel for num_threads(omp_get_max_threads())
+    for (int j = 0; j < h; j += 2) {
+        const uint8_t *srcTop = rgb + j * w * 3;
+        const uint8_t *srcBot = srcTop + w * 3;
+        uint8_t *dstY0 = y + j * strideY;
+        uint8_t *dstY1 = dstY0 + strideY;
+        uint8_t *dstU   = u + (j >> 1) * strideUV;
+        uint8_t *dstV   = v + (j >> 1) * strideUV;
+
+        int i = 0;
+        for (; i < align16(w); i += 16) {
+            __m256i r0, g0, b0, r1, g1, b1;
+            // 0..31
+            __m256i rg0 = _mm256_loadu_si256((const __m256i*)(srcTop + 0));
+            __m256i gb0 = _mm256_loadu_si256((const __m256i*)(srcTop + 32));
+            __m256i br0 = _mm256_loadu_si256((const __m256i*)(srcTop + 64));
+            // 32..63
+            __m256i rg1 = _mm256_loadu_si256((const __m256i*)(srcBot + 0));
+            __m256i gb1 = _mm256_loadu_si256((const __m256i*)(srcBot + 32));
+            __m256i br1 = _mm256_loadu_si256((const __m256i*)(srcBot + 64));
+
+            // 把 RGB 拆成 3 个 256 位向量
+            b0 = _mm256_or_si256(_mm256_and_si256(rg0, _mm256_set1_epi16(0x00FF)),
+                                 _mm256_slli_epi16(_mm256_and_si256(gb0, _mm256_set1_epi16(0xFF00)), -8));
+            g0 = _mm256_or_si256(_mm256_srli_epi16(_mm256_and_si256(rg0, _mm256_set1_epi16(0xFF00)), 8),
+                                 _mm256_and_si256(gb0, _mm256_set1_epi16(0x00FF)));
+            r0 = _mm256_or_si256(_mm256_srli_epi16(_mm256_and_si256(gb0, _mm256_set1_epi16(0xFF00)), 8),
+                                 _mm256_and_si256(br0, _mm256_set1_epi16(0x00FF)));
+
+            b1 = _mm256_or_si256(_mm256_and_si256(rg1, _mm256_set1_epi16(0x00FF)),
+                                 _mm256_slli_epi16(_mm256_and_si256(gb1, _mm256_set1_epi16(0xFF00)), -8));
+            g1 = _mm256_or_si256(_mm256_srli_epi16(_mm256_and_si256(rg1, _mm256_set1_epi16(0xFF00)), 8),
+                                 _mm256_and_si256(gb1, _mm256_set1_epi16(0x00FF)));
+            r1 = _mm256_or_si256(_mm256_srli_epi16(_mm256_and_si256(gb1, _mm256_set1_epi16(0xFF00)), 8),
+                                 _mm256_and_si256(br1, _mm256_set1_epi16(0x00FF)));
+
+            // 16bit → 32bit 零扩展
+            __m256i zero = _mm256_setzero_si256();
+            __m256i r_lo = _mm256_unpacklo_epi16(r0, zero);
+            __m256i r_hi = _mm256_unpackhi_epi16(r0, zero);
+            __m256i g_lo = _mm256_unpacklo_epi16(g0, zero);
+            __m256i g_hi = _mm256_unpackhi_epi16(g0, zero);
+            __m256i b_lo = _mm256_unpacklo_epi16(b0, zero);
+            __m256i b_hi = _mm256_unpackhi_epi16(b0, zero);
+
+            // Y = ( 66*R + 129*G +  25*B + 128) >> 8 + 16
+            __m256i y0_lo = _mm256_add_epi32(_mm256_add_epi32(
+                                _mm256_mullo_epi32(r_lo, _mm256_set1_epi32(66)),
+                                _mm256_mullo_epi32(g_lo, _mm256_set1_epi32(129))),
+                                _mm256_mullo_epi32(b_lo, _mm256_set1_epi32(25)));
+            y0_lo = _mm256_add_epi32(y0_lo, _mm256_set1_epi32(128));
+            y0_lo = _mm256_srli_epi32(y0_lo, 8);
+            y0_lo = _mm256_add_epi32(y0_lo, _mm256_set1_epi32(16));
+            __m256i y0_hi = _mm256_add_epi32(_mm256_add_epi32(
+                                _mm256_mullo_epi32(r_hi, _mm256_set1_epi32(66)),
+                                _mm256_mullo_epi32(g_hi, _mm256_set1_epi32(129))),
+                                _mm256_mullo_epi32(b_hi, _mm256_set1_epi32(25)));
+            y0_hi = _mm256_add_epi32(y0_hi, _mm256_set1_epi32(128));
+            y0_hi = _mm256_srli_epi32(y0_hi, 8);
+            y0_hi = _mm256_add_epi32(y0_hi, _mm256_set1_epi32(16));
+
+            // 压缩成 8bit 并存储
+            __m256i y0_8 = _mm256_packus_epi16(
+                               _mm256_packus_epi32(y0_lo, y0_hi),
+                               _mm256_setzero_si256());
+            y0_8 = _mm256_permute4x64_epi64(y0_8, 0xD8);
+            _mm256_storeu_si256((__m256i*)(dstY0 + i), y0_8);
+
+            // 对下一行再做一次 Y
+            r_lo = _mm256_unpacklo_epi16(r1, zero);
+            r_hi = _mm256_unpackhi_epi16(r1, zero);
+            g_lo = _mm256_unpacklo_epi16(g1, zero);
+            g_hi = _mm256_unpackhi_epi16(g1, zero);
+            b_lo = _mm256_unpacklo_epi16(b1, zero);
+            b_hi = _mm256_unpackhi_epi16(b1, zero);
+
+            __m256i y1_lo = _mm256_add_epi32(_mm256_add_epi32(
+                                _mm256_mullo_epi32(r_lo, _mm256_set1_epi32(66)),
+                                _mm256_mullo_epi32(g_lo, _mm256_set1_epi32(129))),
+                                _mm256_mullo_epi32(b_lo, _mm256_set1_epi32(25)));
+            y1_lo = _mm256_add_epi32(y1_lo, _mm256_set1_epi32(128));
+            y1_lo = _mm256_srli_epi32(y1_lo, 8);
+            y1_lo = _mm256_add_epi32(y1_lo, _mm256_set1_epi32(16));
+            __m256i y1_hi = _mm256_add_epi32(_mm256_add_epi32(
+                                _mm256_mullo_epi32(r_hi, _mm256_set1_epi32(66)),
+                                _mm256_mullo_epi32(g_hi, _mm256_set1_epi32(129))),
+                                _mm256_mullo_epi32(b_hi, _mm256_set1_epi32(25)));
+            __m256i y1_8 = _mm256_packus_epi16(
+                               _mm256_packus_epi32(y1_lo, y1_hi),
+                               _mm256_setzero_si256());
+            y1_8 = _mm256_permute4x64_epi64(y1_8, 0xD8);
+            _mm256_storeu_si256((__m256i*)(dstY1 + i), y1_8);
+
+            // 下采样 U/V：对 2×2 块取平均
+            __m256i r2 = _mm256_avg_epu16(r0, r1);
+            __m256i g2 = _mm256_avg_epu16(g0, g1);
+            __m256i b2 = _mm256_avg_epu16(b0, b1);
+            __m256i r2_lo = _mm256_unpacklo_epi16(r2, zero);
+            __m256i r2_hi = _mm256_unpackhi_epi16(r2, zero);
+            __m256i g2_lo = _mm256_unpacklo_epi16(g2, zero);
+            __m256i g2_hi = _mm256_unpackhi_epi16(g2, zero);
+            __m256i b2_lo = _mm256_unpacklo_epi16(b2, zero);
+            __m256i b2_hi = _mm256_unpackhi_epi16(b2, zero);
+
+            // U = (-38*R - 74*G + 112*B + 128) >> 8 + 128
+            __m256i u_lo = _mm256_add_epi32(
+                               _mm256_add_epi32(
+                                   _mm256_mullo_epi32(r2_lo, _mm256_set1_epi32(-38)),
+                                   _mm256_mullo_epi32(g2_lo, _mm256_set1_epi32(-74))),
+                               _mm256_mullo_epi32(b2_lo, _mm256_set1_epi32(112)));
+            u_lo = _mm256_add_epi32(u_lo, _mm256_set1_epi32(128));
+            u_lo = _mm256_srli_epi32(u_lo, 8);
+            u_lo = _mm256_add_epi32(u_lo, _mm256_set1_epi32(128));
+            __m256i u_hi = _mm256_add_epi32(_mm256_add_epi32(
+                                _mm256_mullo_epi32(r2_hi, _mm256_set1_epi32(66)),
+                                _mm256_mullo_epi32(g2_hi, _mm256_set1_epi32(129))),
+                                _mm256_mullo_epi32(b2_hi, _mm256_set1_epi32(25)));
+            __m256i u_8 = _mm256_packus_epi16(
+                              _mm256_packus_epi32(u_lo, u_hi),
+                              _mm256_setzero_si256());
+            u_8 = _mm256_permute4x64_epi64(u_8, 0xD8);
+            _mm_storeu_si128((__m128i*)(dstU + (i >> 1)), _mm256_castsi256_si128(u_8));
+
+            // V = (112*R - 94*G - 18*B + 128) >> 8 + 128
+            __m256i v_lo = _mm256_add_epi32(
+                               _mm256_add_epi32(
+                                   _mm256_mullo_epi32(r2_lo, _mm256_set1_epi32(112)),
+                                   _mm256_mullo_epi32(g2_lo, _mm256_set1_epi32(-94))),
+                               _mm256_mullo_epi32(b2_lo, _mm256_set1_epi32(-18)));
+            v_lo = _mm256_add_epi32(v_lo, _mm256_set1_epi32(128));
+            v_lo = _mm256_srli_epi32(v_lo, 8);
+            v_lo = _mm256_add_epi32(v_lo, _mm256_set1_epi32(128));
+            __m256i v_hi =_mm256_add_epi32(
+                            _mm256_add_epi32(
+                                _mm256_mullo_epi32(r2_hi, _mm256_set1_epi32(112)),
+                                _mm256_mullo_epi32(g2_hi, _mm256_set1_epi32(-94))),
+                            _mm256_mullo_epi32(b2_hi, _mm256_set1_epi32(-18)));
+            v_hi = _mm256_add_epi32(v_hi, _mm256_set1_epi32(128));
+            v_hi = _mm256_srli_epi32(v_hi, 8);
+            v_hi = _mm256_add_epi32(v_hi, _mm256_set1_epi32(128));
+            __m256i v_8 = _mm256_packus_epi16(
+                              _mm256_packus_epi32(v_lo, v_hi),
+                              _mm256_setzero_si256());
+            v_8 = _mm256_permute4x64_epi64(v_8, 0xD8);
+            _mm_storeu_si128((__m128i*)(dstV + (i >> 1)), _mm256_castsi256_si128(v_8));
+
+            srcTop += 48;
+            srcBot += 48;
+        }
+
+        for (; i < w; i += 2) {
+            int r0 = srcTop[i*3+0], g0 = srcTop[i*3+1], b0 = srcTop[i*3+2];
+            int r1 = srcBot[i*3+0], g1 = srcBot[i*3+1], b1 = srcBot[i*3+2];
+            dstY0[i] = (66*r0 + 129*g0 + 25*b0 + 128)>>8 + 16;
+            dstY1[i] = (66*r1 + 129*g1 + 25*b1 + 128)>>8 + 16;
+            int r2 = (r0+r1)>>1, g2 = (g0+g1)>>1, b2 = (b0+b1)>>1;
+            dstU[i>>1] = ((-38*r2 -74*g2 +112*b2 +128)>>8) + 128;
+            dstV[i>>1] = ((112*r2 -94*g2 -18*b2 +128)>>8) + 128;
+        }
+    }
+}
+
+#else
+#   define HAS_AVX2_RGB24_TO_YUV420 0
+
+void rgb24_to_yuv420_avx2(const uint8_t* rgb, int w, int h, uint8_t* y, uint8_t* u, uint8_t* v) {};
+
+#endif
+
+#include <chrono>
+
 void PutFrame(VideoContext* ctx, iu8* rgbBuffer, i64 width, i64 height) {
     i64 pxCount = width * height;
 
@@ -183,11 +372,22 @@ void PutFrame(VideoContext* ctx, iu8* rgbBuffer, i64 width, i64 height) {
     AVFrame* rgbFrame = av_frame_alloc();
     av_image_alloc(rgbFrame->data, rgbFrame->linesize, width, height, AV_PIX_FMT_RGB24, 1);
 
+    auto t0 = std::chrono::high_resolution_clock::now();
     for (int y = 0; y < height; ++y) {
         memcpy(rgbFrame->data[0] + y * rgbFrame->linesize[0], rgbBuffer + y * width * 3, width * 3);
     }
+    auto t1 = std::chrono::high_resolution_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    // printf("[PutFrame] memcpy: %fms\n", ms);
 
-    sws_scale(ctx->swsCtx, (const iu8* const*)rgbFrame->data, rgbFrame->linesize, 0, height, ctx->frame->data, ctx->frame->linesize);
+    t0 = std::chrono::high_resolution_clock::now();
+
+    if (HAS_AVX2_RGB24_TO_YUV420) rgb24_to_yuv420_avx2(rgbBuffer, width, height, ctx->frame->data[0], ctx->frame->data[1], ctx->frame->data[2]);
+    else sws_scale(ctx->swsCtx, (const iu8* const*)rgbFrame->data, rgbFrame->linesize, 0, height, ctx->frame->data, ctx->frame->linesize);
+
+    t1 = std::chrono::high_resolution_clock::now();
+    ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    // printf("[PutFrame] sws_scale: %fms\n", ms);
 
     ctx->frame->pts = ctx->frameIndex++;
 
