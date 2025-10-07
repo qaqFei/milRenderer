@@ -1,6 +1,6 @@
 # milRenderer
 
-使用 python 编写的 Milthm 自制谱渲染器。
+使用 Python&C++ 编写的 Milthm 自制谱渲染器。
 
 ## 从源码运行
 
@@ -9,7 +9,14 @@
 ```bash
 git clone https://github.com/qaqFei/milRenderer.git --depth 1
 
-cd milRenderer/src
+cd milRenderer
+
+cd src-libSimpleVideoWriter
+bash install_deps.sh
+bash compile.sh
+bash dev_install.sh
+
+cd ../src
 pip install -r requirements.txt
 
 python main.py -i /path/to/milthm/chart/file -o /path/to/output/file
