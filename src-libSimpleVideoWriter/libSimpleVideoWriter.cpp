@@ -365,7 +365,7 @@ void PutFrame(VideoContext* ctx, iu8* rgbBuffer, i64 width, i64 height) {
         ctx->swsCtx = sws_getContext(
             width, height, AV_PIX_FMT_RGB24,
             width, height, AV_PIX_FMT_YUV420P,
-            SWS_FAST_BILINEAR, nullptr, nullptr, nullptr
+            SWS_POINT, nullptr, nullptr, nullptr
         );
     }
 
