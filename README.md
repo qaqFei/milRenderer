@@ -1,6 +1,6 @@
 # milRenderer
 
-使用 Python&C++ 编写的 Milthm 自制谱渲染器。
+使用 Python 和 C++ 编写的 Milthm 自制谱渲染器。
 
 ## 从源码运行
 
