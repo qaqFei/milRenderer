@@ -205,12 +205,13 @@ class _VideoWriter:
         if not res:
             raise RuntimeError("InitializeVideoContext failed")
     
-    def write_frame(self, rgbFrame: bytes, width: int, height: int):
+    def write_frame(self, rgbFrame: bytearray, width: int, height: int):
         PutFrame = self._lib.PutFrame
         PutFrame.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long, ctypes.c_long)
         PutFrame.restype = None
-        
-        PutFrame(self._ptr, rgbFrame, width, height)
+
+        carr = (ctypes.c_ubyte * len(rgbFrame)).from_buffer(rgbFrame)
+        PutFrame(self._ptr, carr, width, height)
 
     def release(self):
         ReleaseVideoContext = self._lib.ReleaseVideoContext
@@ -761,6 +762,34 @@ def _export_audio(audio: np.ndarray, path: str) -> None:
         f.write(b"data")
         f.write(audio.tobytes())
 
+class GlProgManager:
+    def __init__(self, ctx: moderngl.Context):
+        self.ctx = ctx
+        self.progs = {}
+    
+    def add_from_shader(self, name: str, vertex_shader: str, fragment_shader: str):
+        prog = self.ctx.program(vertex_shader, fragment_shader)
+        self.progs[name] = prog
+        return prog
+    
+    def add_from_file(self, name: str, vertex_shader_path: str, fragment_shader_path: str):
+        with open(vertex_shader_path, "r", encoding="utf-8") as f:
+            vertex_shader = f.read()
+            
+        with open(fragment_shader_path, "r", encoding="utf-8") as f:
+            fragment_shader = f.read()
+            
+        return self.add_from_shader(name, vertex_shader, fragment_shader)
+    
+    def __getitem__(self, name: str):
+        return self.progs[name]
+        
+    def __setitem__(self, name: str, prog: moderngl.Program):
+        self.progs[name] = prog
+        
+    def __delitem__(self, name: str):
+        del self.progs[name]
+
 @dataclasses.dataclass
 class WarppedImage:
     data: np.ndarray
@@ -861,9 +890,12 @@ class MilRenderer:
         self.ctx.viewport = (0, 0, cfg.width, cfg.height)
         logger.info(f"set context viewport to {cfg.width}x{cfg.height}")
         self.cfg = cfg
-        self.resloader = MilResourceLoader()
 
         logger.info("loading resouces")
+        self.resloader = MilResourceLoader()
+
+        logger.info("loading gl programs")
+        self.glpman = GlProgManager(self.ctx)
 
         self._initialized = True
     
@@ -949,17 +981,15 @@ class MilRenderer:
             num_frames = min(int(os.environ.get("DEBUG_MAX_NUM_FRAMES")), num_frames)
             logger.debug(f"limited num_frames to {num_frames}")
 
-        buffer = self.ctx.simple_framebuffer((self.cfg.width, self.cfg.height))
-        buffer.use()
-        pixels = buffer.read(components=3, dtype="u1")
-        pixels = b"\x12\x23\x34" * 1920 * 1080
+        fbo = self.ctx.simple_framebuffer((self.cfg.width, self.cfg.height), dtype="u1")
+        fbo.use()
+        pixels = bytearray(self.cfg.width * self.cfg.height * 3)
         for i in tqdm.trange(num_frames, desc="rendering frames"):
-            # t = i * frame_duration
+            fbo.clear(0, 0, 0, 0)
+            t = i * frame_duration
+            self._render_chart(chart, t)
 
-            # self._render_chart(chart, t)
-
-            # buffer.clear()
-
+            fbo.read_into(pixels, (0, 0, self.cfg.width, self.cfg.height), 3, dtype="u1")
             v_writer.write_frame(pixels, self.cfg.width, self.cfg.height)
 
         try:
