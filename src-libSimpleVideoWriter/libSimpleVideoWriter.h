@@ -15,6 +15,8 @@ extern "C" {
     #include <libswscale/swscale.h>
 }
 
+#include <libyuv.h>
+
 struct VideoContext {
     i64 width;
     i64 height;

@@ -356,8 +356,6 @@ void rgb24_to_yuv420_avx2(const uint8_t* rgb, int w, int h, uint8_t* y, uint8_t*
 
 #endif
 
-#include <chrono>
-
 void PutFrame(VideoContext* ctx, iu8* rgbBuffer, i64 width, i64 height) {
     i64 pxCount = width * height;
 
@@ -376,14 +374,18 @@ void PutFrame(VideoContext* ctx, iu8* rgbBuffer, i64 width, i64 height) {
         memcpy(rgbFrame->data[0] + y * rgbFrame->linesize[0], rgbBuffer + y * width * 3, width * 3);
     }
 
-    auto t0 = std::chrono::high_resolution_clock::now();
-
     if (HAS_AVX2_RGB24_TO_YUV420) rgb24_to_yuv420_avx2(rgbBuffer, width, height, ctx->frame->data[0], ctx->frame->data[1], ctx->frame->data[2]);
-    else sws_scale(ctx->swsCtx, (const iu8* const*)rgbFrame->data, rgbFrame->linesize, 0, height, ctx->frame->data, ctx->frame->linesize);
+    else {
+        libyuv::RGB24ToI420(
+            rgbBuffer, width * 3,
+            ctx->frame->data[0], ctx->frame->linesize[0],
+            ctx->frame->data[1], ctx->frame->linesize[1],
+            ctx->frame->data[2], ctx->frame->linesize[2],
+            width, height
+        );
 
-    auto t1 = std::chrono::high_resolution_clock::now();
-    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    // printf("[PutFrame] sws_scale: %fms\n", ms);
+        // sws_scale(ctx->swsCtx, (const iu8* const*)rgbFrame->data, rgbFrame->linesize, 0, height, ctx->frame->data, ctx->frame->linesize);
+    }
 
     ctx->frame->pts = ctx->frameIndex++;
 
