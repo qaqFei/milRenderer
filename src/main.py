@@ -712,6 +712,16 @@ def _decodeImageFromFile(path: str) -> WarppedImage:
     with open(path, "rb") as f:
         return _decodeImageBytes(f.read())
 
+def _loadGlTexture(ctx: mgl.Context, raw: WarppedImage):
+    return ctx.texture(
+        size = raw.data.shape[:2],
+        components = raw.data.shape[2],
+        data = raw.data.tobytes()
+    )
+
+def _loadGlTextureFromFile(ctx: mgl.Context, path: str):
+    return _loadGlTexture(ctx, _decodeImageFromFile(path))
+
 def _get_audio_dur(audio: np.ndarray) -> float:
     return len(audio) / AUDIO_SAMPLE_RATE / _get_channels_from_layout(AUDIO_LAYOUT)
 
@@ -765,7 +775,7 @@ def _export_audio(audio: np.ndarray, path: str) -> None:
 class GlProgManager:
     def __init__(self, ctx: moderngl.Context):
         self.ctx = ctx
-        self.progs: dict[str, moderngl.Program] = {}
+        self.progs: dict[str, mgl.Program] = {}
         self.verts = np.zeros(65536, dtype=[("pos", np.float32, 2), ("uv", np.float32, 2)])
         self.vbo = self.ctx.buffer(self.verts)
         self.vaos: dict[str, moderngl.VertexArray] = {}
@@ -801,19 +811,19 @@ class GlProgManager:
         x1, y1 = x, y
         x2, y2 = x + w, y + h
         vs = np.array([
-            (x1, y1, 0, 0),
-            (x2, y1, 1, 0),
-            (x2, y2, 1, 1),
-            (x1, y1, 0, 0),
-            (x2, y2, 1, 1),
-            (x1, y2, 0, 1),
+            ((x1, y1), (0, 0)),
+            ((x2, y1), (1, 0)),
+            ((x2, y2), (1, 1)),
+            ((x1, y1), (0, 0)),
+            ((x2, y2), (1, 1)),
+            ((x1, y2), (0, 1)),
         ], dtype=[("pos", "2f"), ("uv", "2f")])
 
         self.vbo.write(vs.tobytes())
 
         prog["u_tex"] = 0
         tex.use(0)
-        prog["u_vp"] = tex.ctx.screen.size
+        prog["u_vp"] = self.ctx.viewport[2:]
 
         vao.render(mgl.TRIANGLES, first=0, vertices=6)
     
@@ -832,16 +842,16 @@ class WarppedImage:
     alpha: bool
 
 class MilResourceLoader:
-    def __init__(self):
+    def __init__(self, ctx: mgl.Context):
         self.res = {}
 
         for name in ("tap", "drag", "hold"):
-            self.res[f"{name}"] = _decodeImageFromFile(self.get_res_path(f"{name}.png"))
-            self.res[f"{name}_double"] = _decodeImageFromFile(self.get_res_path(f"{name}_double.png"))
+            self.res[f"{name}"] = _loadGlTextureFromFile(ctx, self.get_res_path(f"{name}.png"))
+            self.res[f"{name}_double"] = _loadGlTextureFromFile(ctx, self.get_res_path(f"{name}_double.png"))
             
             if name != "drag":
-                self.res[f"ex{name}"] = _decodeImageFromFile(self.get_res_path(f"ex{name}.png"))
-                self.res[f"ex{name}_double"] = _decodeImageFromFile(self.get_res_path(f"ex{name}_double.png"))
+                self.res[f"ex{name}"] = _loadGlTextureFromFile(ctx, self.get_res_path(f"ex{name}.png"))
+                self.res[f"ex{name}_double"] = _loadGlTextureFromFile(ctx, self.get_res_path(f"ex{name}_double.png"))
 
             logger.debug(f"loaded note texture {name}")
         
@@ -864,7 +874,11 @@ class MilResourceLoader:
 
             case _:
                 raise ValueError(f"Invalid note type: {typ}")
-    
+
+@dataclasses.dataclass
+class _MilChartRes:
+    imageTex: mgl.Texture
+
 class MilRenderer:
     def __init__(self):
         try:
@@ -928,7 +942,7 @@ class MilRenderer:
         self.cfg = cfg
 
         logger.info("loading resouces")
-        self.resloader = MilResourceLoader()
+        self.resloader = MilResourceLoader(self.ctx)
 
         logger.info("loading gl programs")
         self.glpman = GlProgManager(self.ctx)
@@ -958,6 +972,13 @@ class MilRenderer:
 
             logger.info("loading chart")
             chart = MilChart(chartJson)
+
+            logger.info("loading image")
+            imageTex = _loadGlTexture(self.ctx, _decodeImageBytes(imageBytes))
+
+            chartRes = _MilChartRes(
+                imageTex = imageTex,
+            )
         except Exception as e:
             raise RuntimeError(f"Failed to read files of chart: {e}") from e
         
@@ -1024,7 +1045,7 @@ class MilRenderer:
         for i in tqdm.trange(num_frames, desc="rendering frames"):
             fbo.clear(0, 0, 0, 0)
             t = i * frame_duration
-            self._render_chart(chart, t)
+            self._render_chart(chart, t, chartRes)
 
             fbo.read_into(pixels, (0, 0, self.cfg.width, self.cfg.height), 3, dtype="u1")
             v_writer.write_frame(pixels, self.cfg.width, self.cfg.height)
@@ -1034,8 +1055,8 @@ class MilRenderer:
         except Exception as e:
             raise RuntimeError(f"Failed to close output stream: {e}") from e
     
-    def _render_chart(self, chart: MilChart, t: float):
-        pass
+    def _render_chart(self, chart: MilChart, t: float, cres: _MilChartRes):
+        self.glpman.p_simple_texture(cres.imageTex, 0, 0, 500, 500)
         
 if __name__ == "__main__":
     import argparse
