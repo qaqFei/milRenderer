@@ -1,6 +1,9 @@
 #define i64 long
 #define i32 int
+#define i16 short
+#define iu8 unsigned char
 #define f64 double
+#define f32 float
 
 #include <cstdio>
 
@@ -12,6 +15,10 @@ extern "C" {
 }
 
 struct VideoContext {
+    i64 width;
+    i64 height;
+    f64 frameRate;
+
     AVFormatContext* formatCtx;
     AVCodecContext* codecCtx;
     AVStream* stream;
@@ -24,8 +31,11 @@ struct VideoContext {
     AVStream* aStream;
     AVCodecContext* aCodecCtx;
     i64 audioPts;
-}
+};
 
 extern "C" {
-    VideoContext* CreateVideoCap(i64 width, i64 height, f64 frameRate)
+    VideoContext* CreateVideoContext(i64 width, i64 height, f64 frameRate);
+    bool InitializeVideoContext(VideoContext* ctx, const char* path, bool hasAudio, f32* audioData, i64 aSampleRate, i64 aChannels, i64 aNumFrames, i64 aBitRate);
+    void ReleaseVideoContext(VideoContext* ctx);
+    void PutFrame(VideoContext* ctx, iu8* rgbBuffer, i64 width, i64 height);
 }

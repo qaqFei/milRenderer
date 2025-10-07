@@ -9,6 +9,8 @@ import io
 import json
 import struct
 import time
+import ctypes
+from ctypes.util import find_library
 
 import moderngl as mgl
 import numpy as np
@@ -169,6 +171,55 @@ def tosec(t: list[int], chart: MilChart):
 
     return sec
 
+class _VideoWriter:
+    def __init__(self, width: int, height: int, fps: float):
+        libSVW_path = find_library("libSimpleVideoWriter") or find_library("SimpleVideoWriter")
+        if libSVW_path is None:
+            raise RuntimeError("libSimpleVideoWriter not found")
+
+        self._lib = ctypes.CDLL(libSVW_path)
+
+        CreateVideoContext = self._lib.CreateVideoContext
+        CreateVideoContext.argtypes = (ctypes.c_long, ctypes.c_long, ctypes.c_double)
+        CreateVideoContext.restype = ctypes.c_void_p
+
+        self._ptr = CreateVideoContext(width, height, fps)
+    
+    def initialize(self, path: str, audio: np.ndarray, a_bitrate: int = 192000):
+        InitializeVideoContext = self._lib.InitializeVideoContext
+        InitializeVideoContext.argtypes = (ctypes.c_void_p, ctypes.c_char_p, ctypes.c_bool, ctypes.c_void_p, ctypes.c_long, ctypes.c_long, ctypes.c_long, ctypes.c_long)
+        InitializeVideoContext.restype = ctypes.c_bool
+        
+        audio = _audio_to_f32(audio).reshape(-1, 2).T
+        audio = np.ascontiguousarray(audio)
+        channels = _get_channels_from_layout(AUDIO_LAYOUT)
+
+        res = InitializeVideoContext(
+            self._ptr, path.encode("utf-8"),
+            True, audio.ctypes.data,
+            AUDIO_SAMPLE_RATE, channels,
+            len(audio) // channels, a_bitrate
+        )
+
+        if not res:
+            raise RuntimeError("InitializeVideoContext failed")
+    
+    def write_frame(self, rgbFrame: np.ndarray, width: int, height: int):
+        PutFrame = self._lib.PutFrame
+        PutFrame.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long, ctypes.c_long)
+        PutFrame.restype = None
+
+        rgbFrame = np.ascontiguousarray(rgbFrame)
+        
+        PutFrame(self._ptr, rgbFrame.ctypes.data, width, height)
+
+    def release(self):
+        ReleaseVideoContext = self._lib.ReleaseVideoContext
+        ReleaseVideoContext.argtypes = (ctypes.c_void_p, )
+        ReleaseVideoContext.restype = None
+
+        ReleaseVideoContext(self._ptr)
+    
 class ChartMeta:
     def __init__(self, data: dict):
         self.background_dim = data["background_dim"]
@@ -661,6 +712,9 @@ def _overlay_audio(target: np.ndarray, source: np.ndarray, t: float) -> None:
 def _audio_to_s16(audio: np.ndarray) -> np.ndarray:
     return audio.clip(-32768, 32767).astype(np.int16)
 
+def _audio_to_f32(audio: np.ndarray) -> np.ndarray:
+    return audio.astype(np.float32) / 32768
+
 def _export_audio(audio: np.ndarray, path: str) -> None:
     channels = _get_channels_from_layout(AUDIO_LAYOUT)
     audio = _audio_to_s16(audio)
@@ -772,13 +826,8 @@ class MilRenderer:
         
         try:
             cfg.fps = float(cfg.fps)
-
-            if not cfg.fps.is_integer():
-                raise Exception("fps must be integer")
             
-            cfg.fps = int(cfg.fps)
-            
-            if cfg.fps <= 0:
+            if cfg.fps <= 0.0:
                 raise Exception("fps must be positive")
         except Exception as e:
             raise ValueError(f"Invalid fps: {cfg.fps}") from e
@@ -854,21 +903,19 @@ class MilRenderer:
             raise RuntimeError(f"Failed to mix audio: {e}") from e
         
         try:
-            v_cont = av.open(self.cfg.video_path, "w")
-            v_stream = v_cont.add_stream("h264", rate=self.cfg.fps)
-            v_stream.width, v_stream.height = self.cfg.width, self.cfg.height
-            v_stream.pix_fmt = "yuv420p"
-            a_stream = v_cont.add_stream("aac", rate=AUDIO_SAMPLE_RATE, layout=AUDIO_LAYOUT)
+            v_writer = _VideoWriter(self.cfg.width, self.cfg.height, self.cfg.fps)
         except Exception as e:
             raise RuntimeError(f"Failed to open output stream: {e}") from e
         
         try:
-            audio_frames = _createAudioFrames(decoededAudio)
+            # audio_frames = _createAudioFrames(decoededAudio)
             
-            for frame in tqdm.tqdm(audio_frames, desc="encoding audio"):
-                packets = a_stream.encode(frame)
-                for packet in packets:
-                    v_cont.mux(packet)
+            # for frame in tqdm.tqdm(audio_frames, desc="encoding audio"):
+            #     packets = a_stream.encode(frame)
+            #     for packet in packets:
+            #         v_cont.mux(packet)
+
+            v_writer.initialize(self.cfg.video_path, decoededAudio)
         except Exception as e:
             raise RuntimeError(f"Failed to write audio stream: {e}") from e
         
@@ -877,6 +924,10 @@ class MilRenderer:
         frame_duration = 1.0 / self.cfg.fps
         num_frames = int(duration // frame_duration) + 1
 
+        if os.environ.get("DEBUG_MAX_NUM_FRAMES"):
+            num_frames = min(int(os.environ.get("DEBUG_MAX_NUM_FRAMES")), num_frames)
+            logger.debug(f"limited num_frames to {num_frames}")
+
         buffer = self.ctx.simple_framebuffer((self.cfg.width, self.cfg.height))
         buffer.use()
         for i in tqdm.trange(num_frames, desc="rendering frames"):
@@ -884,16 +935,13 @@ class MilRenderer:
 
             self._render_chart(chart, t)
 
-            pixels = np.frombuffer(buffer.read(components=3, dtype="u1"), dtype=np.uint8).reshape((self.cfg.height, self.cfg.width, 3)).transpose(1, 0, 2)
+            pixels = np.frombuffer(buffer.read(components=3, dtype="u1"), dtype=np.uint8)
             buffer.clear()
-            
-            frame = av.VideoFrame.from_ndarray(pixels, format="rgb24")
-            packets = v_stream.encode(frame)
-            for packet in packets:
-                v_cont.mux(packet)
+
+            v_writer.write_frame(pixels, self.cfg.width, self.cfg.height)
 
         try:
-            v_cont.close()
+            v_writer.release()
         except Exception as e:
             raise RuntimeError(f"Failed to close output stream: {e}") from e
     
@@ -908,7 +956,7 @@ if __name__ == "__main__":
     aparser.add_argument("-o", "--output", type=str, required=True)
     aparser.add_argument("-s-w", "--width", type=int, default=1920)
     aparser.add_argument("-s-h", "--height", type=int, default=1080)
-    aparser.add_argument("-f", "--fps", type=int, default=60)
+    aparser.add_argument("-f", "--fps", type=float, default=60.0)
     aparser.add_argument("-y", "--yes", action="store_true", default=False)
 
     args = aparser.parse_args()
