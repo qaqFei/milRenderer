@@ -185,17 +185,18 @@ class _VideoWriter:
 
         self._ptr = CreateVideoContext(width, height, fps)
     
-    def initialize(self, path: str, audio: np.ndarray, a_bitrate: int = 192000):
+    def initialize(self, path: str, v_codec: str, a_codec: str, audio: np.ndarray, a_bitrate: int = 192000):
         InitializeVideoContext = self._lib.InitializeVideoContext
-        InitializeVideoContext.argtypes = (ctypes.c_void_p, ctypes.c_char_p, ctypes.c_bool, ctypes.c_void_p, ctypes.c_long, ctypes.c_long, ctypes.c_long, ctypes.c_long)
+        InitializeVideoContext.argtypes = (ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_bool, ctypes.c_void_p, ctypes.c_long, ctypes.c_long, ctypes.c_long, ctypes.c_long)
         InitializeVideoContext.restype = ctypes.c_bool
         
-        audio = _audio_to_f32(audio).reshape(-1, 2).T
+        audio = _audio_to_f32(audio)
         audio = np.ascontiguousarray(audio)
         channels = _get_channels_from_layout(AUDIO_LAYOUT)
 
         res = InitializeVideoContext(
             self._ptr, path.encode("utf-8"),
+            v_codec.encode("utf-8"), a_codec.encode("utf-8"),
             True, audio.ctypes.data,
             AUDIO_SAMPLE_RATE, channels,
             len(audio) // channels, a_bitrate
@@ -219,6 +220,33 @@ class _VideoWriter:
         ReleaseVideoContext.restype = None
 
         ReleaseVideoContext(self._ptr)
+    
+    def get_encoders(self, is_video: bool):
+        GetEncoders = self._lib.GetEncoders
+        GetEncoders.argtypes = (ctypes.c_bool,)
+        GetEncoders.restype = ctypes.POINTER(ctypes.c_ubyte)
+
+        raw_ptr = GetEncoders(is_video)
+        size = 0
+        while raw_ptr[size]:
+            while raw_ptr[size]:
+                size += 1
+            size += 1
+        data = ctypes.string_at(raw_ptr, size)
+
+        FreeString = self._lib.FreeString
+        FreeString.argtypes = (ctypes.c_void_p,)
+        FreeString.restype = None
+        FreeString(raw_ptr)
+
+        return [i.decode("utf-8") for i in data.split(b"\0")][:-1]
+    
+    def has_encoder(self, name: str):
+        hasEncoder = self._lib.HasEncoder
+        hasEncoder.argtypes = (ctypes.c_char_p, )
+        hasEncoder.restype = ctypes.c_bool
+
+        return hasEncoder(name.encode("utf-8"))
     
 class ChartMeta:
     def __init__(self, data: dict):
@@ -613,6 +641,8 @@ class MilRendererConfig:
     fps: float
     input_path: str
     video_path: str
+    v_codec: str
+    a_codec: str
 
 def _normZipPath(path: str) -> str:
     path = path.replace("\\", "/")
@@ -732,20 +762,6 @@ def _export_audio(audio: np.ndarray, path: str) -> None:
         f.write(struct.pack("<H", 2 * 8))
         f.write(b"data")
         f.write(audio.tobytes())
-
-def _createAudioFrames(audio: np.ndarray) -> list[av.AudioFrame]:
-    audio = _audio_to_s16(audio)
-    frames = []
-    frame_size = 1024
-    channels = _get_channels_from_layout(AUDIO_LAYOUT)
-
-    for i in range(0, len(audio), frame_size):
-        frame = av.AudioFrame.from_ndarray(audio[i:i+frame_size].reshape((1, -1)), format="s16", layout=AUDIO_LAYOUT)
-        # frame.pts = i * frame_size / AUDIO_SAMPLE_RATE * 1000
-        frame.sample_rate = AUDIO_SAMPLE_RATE
-        frames.append(frame)
-    
-    return frames
 
 @dataclasses.dataclass
 class WarppedImage:
@@ -908,16 +924,20 @@ class MilRenderer:
             raise RuntimeError(f"Failed to open output stream: {e}") from e
         
         try:
-            # audio_frames = _createAudioFrames(decoededAudio)
-            
-            # for frame in tqdm.tqdm(audio_frames, desc="encoding audio"):
-            #     packets = a_stream.encode(frame)
-            #     for packet in packets:
-            #         v_cont.mux(packet)
+            v_codecs = v_writer.get_encoders(True)
+            a_codecs = v_writer.get_encoders(False)
+            logger.debug(f"supported video encoders: {v_codecs}")
+            logger.debug(f"supported audio encoders: {a_codecs}")
 
-            v_writer.initialize(self.cfg.video_path, decoededAudio)
+            if self.cfg.v_codec not in v_codecs:
+                raise Exception(f"unsupported video codec: {self.cfg.v_codec}")
+            
+            if self.cfg.a_codec not in a_codecs:
+                raise Exception(f"unsupported audio codec: {self.cfg.a_codec}")
+            
+            v_writer.initialize(self.cfg.video_path, self.cfg.v_codec, self.cfg.a_codec, decoededAudio)
         except Exception as e:
-            raise RuntimeError(f"Failed to write audio stream: {e}") from e
+            raise RuntimeError(f"Failed to initialize output stream: {e}") from e
         
         t = 0.0
         duration = _get_audio_dur(decoededAudio)
@@ -958,6 +978,8 @@ if __name__ == "__main__":
     aparser.add_argument("-s-h", "--height", type=int, default=1080)
     aparser.add_argument("-f", "--fps", type=float, default=60.0)
     aparser.add_argument("-y", "--yes", action="store_true", default=False)
+    aparser.add_argument("-vc", "--video-codec", type=str, default="libx264")
+    aparser.add_argument("-ac", "--audio-codec", type=str, default="aac")
 
     args = aparser.parse_args()
 
@@ -973,7 +995,9 @@ if __name__ == "__main__":
         height = args.height,
         fps = args.fps,
         input_path = args.input,
-        video_path = args.output
+        video_path = args.output,
+        v_codec = args.video_codec,
+        a_codec = args.audio_codec
     ))
 
     renderer.run()

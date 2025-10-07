@@ -22,11 +22,12 @@ static const char* av_err2str_cpp(int err) {
 
 bool InitializeVideoContext(
     VideoContext* ctx, const char* path,
+    const char* vCodecName, const char* aCodecName,
     bool hasAudio,
     f32* audioData, i64 aSampleRate, i64 aChannels, i64 aNumFrames,
     i64 aBitRate
 ) {
-    const AVCodec* vCodec = avcodec_find_encoder(AV_CODEC_ID_H264);
+    const AVCodec* vCodec = avcodec_find_encoder_by_name(vCodecName);
     if (!vCodec) return false;
 
     ctx->stream = avformat_new_stream(ctx->formatCtx, vCodec);
@@ -52,14 +53,12 @@ bool InitializeVideoContext(
     ctx->hasAudio = hasAudio;
 
     if (ctx->hasAudio) {
-        const AVCodec* aCodec = avcodec_find_encoder(AV_CODEC_ID_AAC);
+        const AVCodec* aCodec = avcodec_find_encoder_by_name(aCodecName);
         if (!aCodec) { fprintf(stderr,"no AAC encoder\n"); return false; }
 
         ctx->aStream = avformat_new_stream(ctx->formatCtx, aCodec);
-        printf("aStream: %p\n", ctx->aStream);
         ctx->aCodecCtx = avcodec_alloc_context3(aCodec);
 
-        // 
         ctx->aCodecCtx->sample_fmt = AV_SAMPLE_FMT_FLTP;
         ctx->aCodecCtx->bit_rate = aBitRate;
         ctx->aCodecCtx->sample_rate = (i32)aSampleRate;
@@ -93,7 +92,6 @@ bool InitializeVideoContext(
 
         for (i64 offset = 0; offset + frameSize <= aNumFrames; offset += frameSize)
         {
-            //
             AVFrame* f = av_frame_alloc();
             f->format = ctx->aCodecCtx->sample_fmt;
             av_channel_layout_copy(&f->ch_layout, &ctx->aCodecCtx->ch_layout);
@@ -207,4 +205,38 @@ void PutFrame(VideoContext* ctx, iu8* rgbBuffer, i64 width, i64 height) {
 END:
     av_freep(&rgbFrame->data[0]);
     av_frame_free(&rgbFrame);
+}
+
+char* GetEncoders(bool isVideo) {
+    const AVCodec* c = nullptr;
+    void* opaque = nullptr;
+    std::string res;
+
+    while ((c = av_codec_iterate(&opaque))) {
+        if (!av_codec_is_encoder(c)) continue;
+        if (c->type == AVMEDIA_TYPE_VIDEO && isVideo) {
+            res += c->name;
+            res += '\0';
+        } else if (c->type == AVMEDIA_TYPE_AUDIO && !isVideo) {
+            res += c->name;
+            res += '\0';
+        }
+    }
+
+    res += '\0';
+    
+    char* heap = (char*)malloc(res.size() + 1);
+    memcpy(heap, res.data(), res.size());
+    heap[res.size()] = '\0';
+    return heap;   
+}
+
+void FreeString(char* str) {
+    free(str);
+}
+
+bool HasEncoder(const char* name) {
+    if (!name) return false;
+    const AVCodec* c = avcodec_find_encoder_by_name(name);
+    return c != nullptr;
 }
