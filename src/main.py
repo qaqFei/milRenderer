@@ -10,6 +10,8 @@ import json
 import struct
 import time
 import collections
+import math
+import random
 import ctypes
 from ctypes.util import find_library
 
@@ -146,6 +148,118 @@ class EnumNoteType:
     Drag = 1
 
 MAX_ANIMKEY = EnumAnimationKey.VisibleArea
+
+def num2rgba(v: int|float):
+    v = int(v)
+    return (
+        (v >> 24) & 0xFF,
+        (v >> 16) & 0xFF,
+        (v >> 8) & 0xFF,
+        v & 0xFF
+    )
+
+def rotate_point(x: float, y: float, deg: float, l: float):
+    r = math.radians(deg)
+    c = math.cos(r)
+    s = math.sin(r)
+    return (
+        x + c * l,
+        y + s * l
+    )
+def rotate_point_rad(x: float, y: float, rad: float, l: float):
+    c = math.cos(rad)
+    s = math.sin(rad)
+    return (
+        x + c * l,
+        y + s * l
+    )
+
+def is_intersect(
+    line_1: tuple[
+        tuple[float, float],
+        tuple[float, float]
+    ],
+    line_2: tuple[
+        tuple[float, float],
+        tuple[float, float]
+    ]
+) -> bool:
+    return not (
+        max(line_1[0][0], line_1[1][0]) < min(line_2[0][0], line_2[1][0]) or
+        max(line_2[0][0], line_2[1][0]) < min(line_1[0][0], line_1[1][0]) or
+        max(line_1[0][1], line_1[1][1]) < min(line_2[0][1], line_2[1][1]) or
+        max(line_2[0][1], line_2[1][1]) < min(line_1[0][1], line_1[1][1])
+    )
+
+def batch_is_intersect(
+    lines_group_1: list[tuple[
+        tuple[float, float],
+        tuple[float, float]
+    ]],
+    lines_group_2: list[tuple[
+        tuple[float, float],
+        tuple[float, float]
+    ]]
+):
+    for i in lines_group_1:
+        for j in lines_group_2:
+            yield is_intersect(i, j)
+
+def getScreenPoints(w: int, h: int):
+    return [(0, 0), (w, 0), (w, h), (0, h)]
+
+def polygon2lines(p: list[tuple[float, float]]):
+    return [(p[i], p[i + 1]) for i in range(-1, len(p) - 1)]
+
+def pointInPolygon(ploygon: list[tuple[float, float]], point: tuple[float, float]):
+    n = len(ploygon)
+    j = n - 1
+    res = False
+    for i in range(n):
+        if (
+            (ploygon[i][1] > point[1]) != (ploygon[j][1] > point[1])
+            and (
+                point[0] < (
+                    (ploygon[j][0] - ploygon[i][0])
+                    * (point[1] - ploygon[i][1])
+                    / (ploygon[j][1] - ploygon[i][1])
+                    + ploygon[i][0]
+                )
+            )
+        ):
+            res = not res
+        j = i
+    return res
+
+def polygonIntersect(p1: list[tuple[float, float]], p2: list[tuple[float, float]]):
+    return (
+        any(batch_is_intersect(polygon2lines(p1), polygon2lines(p2)))
+        or any(pointInPolygon(p1, i) for i in p2)
+        or any(pointInPolygon(p2, i) for i in p1)
+    )
+
+def polygonInScreen(w: int, h: int, polygon: list[tuple[float, float]]):
+    return polygonIntersect(getScreenPoints(w, h), polygon)
+
+def getLineLength(x0: float, y0: float, x1: float, y1: float):
+    try:
+        return ((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5
+    except OverflowError:
+        return float("inf")
+
+fixorp = lambda x: max(0, min(x, 1))
+
+def milpos2scrpos(x: float, y: float, w: float, h: float):
+    return (
+        (x / MIL_SCRW + 0.5) * w,
+        (1 - (y / MIL_SCRH + 0.5)) * h
+    )
+
+def milpos2scrpos_cen(x: float, y: float, w: float, h: float):
+    return (
+        (x / MIL_SCRW) * w,
+        (y / MIL_SCRH) * h * -1
+    )
 
 def beatval(beat: list[int]):
     return beat[0] + beat[1] / beat[2]
@@ -789,6 +903,10 @@ def _export_audio(audio: np.ndarray, path: str) -> None:
         f.write(b"data")
         f.write(audio.tobytes())
 
+def _loadJsonFromFile(path: str):
+    with open(path, "r") as f:
+        return json.load(f)
+
 class _2DTransform:
     def __init__(self, matrix: typing.Optional[tuple[float, float, float, float, float, float]] = None):
         self.matrix = matrix if matrix is not None else (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
@@ -862,11 +980,11 @@ class _2DTransform:
         )
         return _2DTransform(inv)
     
-    def save():
+    def save(self):
         self._states.append(self.matrix)
     
-    def restore():
-        if self._states.empty():
+    def restore(self):
+        if len(self._states) < 1:
             return
 
         self.matrix = self._states.pop()
@@ -875,7 +993,7 @@ class _2DTransform:
         return type("_2DTransformWarp", (object, ), {
             "__enter__": lambda *_: self.save(),
             "__exit__": lambda *_: self.restore()
-        })
+        })()
 
 class _GlProgManager:
     def __init__(self, ctx: moderngl.Context):
@@ -916,13 +1034,14 @@ class _GlProgManager:
         
         return (" ".join(tns), *map(lambda x: x[0], typ))
     
-    def _norm_xy(self, x: float, y: float, w: float, h: float):
+    def _norm_xy(self, x: float, y: float):
         sw, sh = self.ctx.viewport[2:4]
-        x1 = (x / sw) * 2 - 1
-        y1 = 1 - (y / sh) * 2
-        x2 = ((x + w) / sw) * 2 - 1
-        y2 = 1 - ((y + h) / sh) * 2
-        return x1, y1, x2, y2
+        x = (x / sw) * 2 - 1
+        y = 1 - (y / sh) * 2
+        return x, y
+
+    def _norm_rect_xy(self, x: float, y: float, w: float, h: float):
+        return *self._norm_xy(x, y), *self._norm_xy(x + w, y + h)
 
     def p_simple_texture(self, tex: moderngl.Texture, x: float, y: float, w: float, h: float, u: flaot = 0.0, v: float = 0.0, uw: float = 1.0, vh: float = 1.0):
         progn = "simple_texture"
@@ -933,7 +1052,7 @@ class _GlProgManager:
             ("in_uv", np.float32, 2),
         ]
 
-        x1, y1, x2, y2 = self._norm_xy(x, y, w, h)
+        x1, y1, x2, y2 = self._norm_rect_xy(x, y, w, h)
 
         vsbytes = np.array([
             ((x1, y2), (u, v + vh),),
@@ -958,38 +1077,58 @@ class _GlProgManager:
 
         vao.render(mgl.TRIANGLES)
     
-    def p_simple_rect(self, x: float, y: float, w: float, h: float, fill_color: typing.Iterable[float, float, float, float]):
-        progn = "simple_rect"
+    def w_simple_texture_uvse(self, tex: moderngl.Texture, x: float, y: float, w: float, h: float, us: float = 0.0, ue: float = 1.0, vs: float = 0.0, ve: float = 1.0):
+        return self.p_simple_texture(tex, x, y, w, h, us, vs, ue - us, ve - vs)
+    
+    def p_simple_polygon(self, points: typing.Iterable[tuple[float, float]], fill_color: typing.Iterable[float, float, float, float]):
+        if len(points) < 3:
+            return
+
+        progn = "simple_polygon"
         prog = self.progs[progn]
+        fill_color = tuple(fill_color)
+        fill_color = (fill_color[2], fill_color[1], fill_color[0], fill_color[3])
 
         dtyp = [
             ("in_pos", np.float32, 2),
         ]
 
-        x1, y1, x2, y2 = self._norm_xy(x, y, w, h)
-
         u, v, uw, vh = 0, 0, 1, 1
         vsbytes = np.array([
-            ((x1, y2), ),
-            ((x2, y2), ),
-            ((x1, y1), ),
-            ((x2, y1), ),
+            (self._norm_xy(*p), )
+            for p in points
         ], dtype=dtyp).tobytes()
 
         vertices = self.ctx.buffer(vsbytes)
-        ibo = self.ctx.buffer(np.array([0, 1, 2, 1, 3, 2], dtype=np.uint8).tobytes())
+        indices = np.arange(1, len(points) - 1, dtype=np.uint32)
+        indices = np.column_stack((np.zeros_like(indices), indices, indices + 1)).ravel() # 0, 1, 2, 0, 2, 3, 0, 3, 4, ..., 0, n -1, n
+        ibo = self.ctx.buffer(indices.tobytes())
 
         vao = self.ctx.vertex_array(
             prog,
             [(vertices, *self._get_vs_typ(dtyp))],
             index_buffer=ibo,
-            index_element_size=1
+            index_element_size=4 # uint32
         )
 
         prog["u_fill_color"].value = fill_color
         self._set_v_uniforms(prog)
 
         vao.render(mgl.TRIANGLES)
+    
+    def w_simple_rect(self, x: float, y: float, w: float, h: float, fill_color: typing.Iterable[float, float, float, float]):
+        return self.p_simple_polygon(((x, y), (x + w, y), (x + w, y + h), (x, y + h)), fill_color)
+    
+    def w_simple_line(self, x1: float, y1: float, x2: float, y2: float, line_width: float, line_color: typing.Iterable[float, float, float, float]):
+        l = math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+        vx = (x2 - x1) / l * line_width / 2
+        vy = (y2 - y1) / l * line_width / 2
+        self.p_simple_polygon((
+            (x1 - vx, y1 - vy),
+            (x2 - vx, y2 + vy),
+            (x2 + vy, y2 + vy),
+            (x1 + vy, y1 - vy),
+        ), line_color)
 
     def __getitem__(self, name: str):
         return self.progs[name]
@@ -1025,6 +1164,9 @@ class MilResourceLoader:
             "hit": _decodeAudioFromFile(self.get_res_path("hit.ogg")),
             "drag": _decodeAudioFromFile(self.get_res_path("drag.ogg")),
         }
+
+        self.res["line_head"] = _loadGlTextureFromFile(ctx, self.get_res_path("line_head.png"))
+        self.res["meta"] = _loadJsonFromFile(self.get_res_path("meta.json"))
     
     @staticmethod
     def get_res_path(name: str):
@@ -1057,7 +1199,7 @@ class MilRenderer:
                 raise RuntimeError("Failed to create rendering context") from e
         
         self.ctx.enable(mgl.BLEND)
-        self.ctx.blend_func = (mgl.SRC_ALPHA, mgl.ONE_MINUS_SRC_ALPHA, mgl.SRC_ALPHA, mgl.ONE_MINUS_SRC_ALPHA)
+        self.ctx.blend_func = (mgl.SRC_ALPHA, mgl.ONE_MINUS_SRC_ALPHA, mgl.ONE, mgl.ONE)
 
         logger.info("created rendering context")
         logger.debug(f"rendering context info: {self.ctx.info}")
@@ -1116,7 +1258,7 @@ class MilRenderer:
         logger.info("loading gl programs")
         self.glpman = _GlProgManager(self.ctx)
         self.glpman.add_from_folder("simple_texture")
-        self.glpman.add_from_folder("simple_rect")
+        self.glpman.add_from_folder("simple_polygon")
 
         self._initialized = True
     
@@ -1212,6 +1354,8 @@ class MilRenderer:
         fbo = self.ctx.simple_framebuffer((self.cfg.width, self.cfg.height), dtype="u1")
         fbo.use()
         pixels = bytearray(self.cfg.width * self.cfg.height * 3)
+        self.current_hit_effects = []
+
         for i in tqdm.trange(num_frames, desc="rendering frames"):
             fbo.clear(0, 0, 0, 0)
             t = i * frame_duration
@@ -1235,8 +1379,164 @@ class MilRenderer:
         else:
             bg_size = (self.cfg.width * scr_ratio / bg_ratio, self.cfg.height)
         
+        chart.update(t)
         self.glpman.p_simple_texture(cres.imageTex, bg_size[0] / 2 - w / 2, bg_size[1] / 2 - h / 2, *bg_size)
-        self.glpman.p_simple_rect(0, 0, w, h / 3, (0, 0, 0, chart.meta.background_dim))
+        self.glpman.w_simple_rect(0, 0, w, h, (0, 0, 0, chart.meta.background_dim))
+        # ctx.draw_vertical_mut_grd(0, h * 0.6, w, h * 0.4, [
+        #     (0.0, (0, 0, 0, 0.0)),
+        #     (0.25, (0, 0, 0, 0.3)),
+        #     (0.5, (0, 0, 0, 0.6)),
+        #     (0.75, (0, 0, 0, 0.9)),
+        #     (1.0, (0, 0, 0, 1.0)),
+        # ])
+
+        for line in chart.lines:
+            linePos = milpos2scrpos(line.acollection.get_value(EnumAnimationKey.PositionX), line.acollection.get_value(EnumAnimationKey.PositionY), w, h)
+            lineTransp = line.acollection.get_value(EnumAnimationKey.Transparency)
+            lineSize = line.acollection.get_value(EnumAnimationKey.Size)
+            lineRot = line.acollection.get_value(EnumAnimationKey.Rotation)
+            lineFsp = line.acollection.get_value(EnumAnimationKey.FlowSpeed)
+            lineRelPos = milpos2scrpos_cen(line.acollection.get_value(EnumAnimationKey.RelativeX), line.acollection.get_value(EnumAnimationKey.RelativeY), w, h)
+            lineHeadTransp = line.acollection.get_value(EnumAnimationKey.LineHeadTransparency)
+            lineBodyTransp = line.acollection.get_value(EnumAnimationKey.LineBodyTransparency)
+            noteWholeTransp = line.acollection.get_value(EnumAnimationKey.WholeTransparency)
+            lineColor = line.acollection.get_value(EnumAnimationKey.Color)
+            lineVisa = line.acollection.get_value(EnumAnimationKey.VisibleArea)
+            lineFp = line.acollection.get_value(EnumAnimationKey.Speed)
+            lineCen = (linePos[0] + lineRelPos[0], linePos[1] + lineRelPos[1])
+            lineColor = tuple(map(lambda x: x / 255, lineColor))
+
+            lineHeadPxSize = (w + h) * LINE_HEAD_SIZE * lineSize
+            lineHeadPxBorder = (w + h) * LINE_HEAD_BORDER * lineSize
+
+            if lineSize > 0.0:
+                with self.glpman.trans.warp():
+                    # ctx.apply_color_transform(*lineColor)
+                    # ctx.apply_color_transform(1, 1, 1, lineTransp * lineHeadTransp)
+                    self.glpman.p_simple_texture(
+                        self.resloader.res["line_head"],
+                        lineCen[0] - lineHeadPxSize / 2,
+                        lineCen[1] - lineHeadPxSize / 2,
+                        lineHeadPxSize, lineHeadPxSize,
+                    )
+
+                with self.glpman.trans.warp():
+                    # ctx.apply_color_transform(*lineColor)
+                    # ctx.apply_color_transform(1, 1, 1, lineTransp * lineBodyTransp)
+                    lineBodyP1 = rotate_point(*lineCen, lineRot + 180, max(lineHeadPxSize / 2 - 1.0, 0.0))
+                    lineBodyP2 = rotate_point(*lineBodyP1, lineRot + 180, h * 2.5)
+                    self.glpman.w_simple_line(*lineBodyP1, *lineBodyP2, lineHeadPxBorder * 0.75, (1, 1, 1, 0.8))
+            
+            if not line.notes:
+                continue
+            
+            with self.glpman.trans.warp():
+                self.glpman.trans.translate(*lineCen)
+                self.glpman.trans.rotateDegree(lineRot - 90)
+                self.glpman.trans.scale(lineSize, lineSize)
+
+                for ngroup in line.note_groups:
+                    for i, (note, rm) in enumerate(ngroup):
+                        noteClicked = note.time <= t
+
+                        if noteClicked and not note.clicked:
+                            note.clicked = True
+                            self.current_hit_effects.append(MilHitEffect(note, note.time))
+                        
+                        # while note.ishold and note.holdLastSpwanHitEffectTime + HOLD_SPWAN_HIT_EFFECT_SEP <= t:
+                        #     note.holdLastSpwanHitEffectTime += HOLD_SPWAN_HIT_EFFECT_SEP
+                        #     current_hit_effects.append(MilHitEffect(note, note.holdLastSpwanHitEffectTime))
+
+                        if note.ishold and note.endTime + HOLD_DISAPPEAR_TIME < t:
+                            rm()
+                            continue
+
+                        if not note.ishold and noteClicked:
+                            rm()
+                            continue
+
+                        noteFsp = lineFsp * note.acollection.get_value(EnumAnimationKey.FlowSpeed)
+                        noteFpMult = SPEED_UNIT / MIL_SCRH * h * FLOW_SPEED * noteFsp
+                        rawNoteFp = note.floorPosition - lineFp
+                        noteCurrFp = rawNoteFp * noteFpMult
+                        noteRelPos = milpos2scrpos_cen(note.acollection.get_value(EnumAnimationKey.RelativeX), note.acollection.get_value(EnumAnimationKey.RelativeY), w, h)
+                        notePos = (0, -noteCurrFp)
+
+                        if note.ishold and noteClicked:
+                            notePos = (0, 0)
+                        
+                        if note.acollection.anim_groups[EnumAnimationKey.PositionX]:
+                            notePos = (note.acollection.get_value(EnumAnimationKey.PositionX) / MIL_SCRW * w, notePos[1])
+                        
+                        if note.acollection.anim_groups[EnumAnimationKey.PositionY]:
+                            notePos = (notePos[0], note.acollection.get_value(EnumAnimationKey.PositionY) / MIL_SCRH * h)
+                        
+                        notePos = (notePos[0] + noteRelPos[0], notePos[1] + noteRelPos[1])
+                        noteSize = note.acollection.get_value(EnumAnimationKey.Size) * NOTE_SCALE
+                        noteWidth = (w + h) * NOTE_SIZE
+                        noteTex = self.resloader.res[note.texname]
+
+                        if noteCurrFp > lineVisa / MIL_SCRH * h:
+                            continue
+                        
+                        noteTransp = note.acollection.get_value(EnumAnimationKey.Transparency)
+                        noteRot = -90-note.acollection.get_value(EnumAnimationKey.Rotation)
+
+                        if note.ishold:
+                            noteTransp *= 1.0 - fixorp((t - note.endTime) / HOLD_DISAPPEAR_TIME)
+                        
+                        with self.glpman.trans.warp():
+                            # ctx.apply_color_transform(*map(lambda x: x / 255, note.acollection.get_value(EnumAnimationKey.Color)))
+                            # ctx.apply_color_transform(1, 1, 1, noteTransp)
+                            self.glpman.trans.translate(*notePos)
+                            self.glpman.trans.rotateDegree(noteRot)
+                            self.glpman.trans.scale(noteSize, noteSize)
+
+                            if not note.ishold:
+                                noteHeight = noteWidth / noteTex.width * noteTex.height
+                                poly = self.glpman.trans.getCRectPoints(0, 0, noteWidth, noteHeight)
+                            else:
+                                altas = self.resloader.res["meta"]["holdAtlas" if not note.morebets else "holdDoubleAtlas"]
+                                holdHeadHeight = holdTailHeight = noteWidth / 2
+                                holdLength = max(0, (note.endFloorPosition - (lineFp if noteClicked else note.floorPosition)) * noteFpMult)
+                                poly = self.glpman.trans.getCRectPoints(holdLength / 2, 0, holdLength + holdHeadHeight + holdTailHeight, noteWidth)
+                                
+                            if not polygonInScreen(w, h, poly):
+                                if ngroup.can_break and ((
+                                    getLineLength(w / 2, h / 2, *self.glpman.trans.getPoint(0, (1 if noteFpMult > 0 else -1))) - 
+                                    getLineLength(w / 2, h / 2, *self.glpman.trans.getPoint(0, 0)) > 0.0
+                                ) or noteFpMult == 0.0):
+                                    break
+
+                            if not note.ishold:
+                                self.glpman.p_simple_texture(noteTex, -noteWidth / 2, -noteHeight / 2, noteWidth, noteHeight)
+                            else:
+                                self.glpman.w_simple_texture_uvse(noteTex, -holdHeadHeight, -noteWidth / 2, holdHeadHeight + 1, noteWidth, 0, altas[0] / noteTex.width, 0.0, 1.0)
+                                self.glpman.w_simple_texture_uvse(noteTex, 0, -noteWidth / 2, holdLength + 1, noteWidth, altas[0] / noteTex.width, 1.0 - altas[1] / noteTex.width, 0.0, 1.0)
+                                self.glpman.w_simple_texture_uvse(noteTex, holdLength, -noteWidth / 2, holdTailHeight + 1, noteWidth, 1.0 - altas[1] / noteTex.width, 1.0, 0.0, 1.0)
+                            
+                            note.transform = self.glpman.trans.matrix
+
+        self.current_hit_effects.sort(key = lambda x: x.t)
+        removes_hit_effects = []
+        for hite in self.current_hit_effects:
+            if hite.t + HIT_EFFECT_DUR < t:
+                removes_hit_effects.append(hite)
+                continue
+
+            # ctx.save_state()
+            # ctx.set_transform(*hite.note.transform)
+
+            # p = 1.0 - (hite.t + HIT_EFFECT_DUR - t) / HIT_EFFECT_DUR
+            # size = (w + h) * HITEFFECT_SIZE * (1.0 - (1.0 - p) ** 3)
+            # texgroup = hit_effect_texs[hite.group]
+            # tex = texgroup[int(p * (len(texgroup) - 1))]
+
+            # ctx.draw_texture(tex, -size / 2, -size / 2, size, size)
+            # ctx.restore_state()
+        
+        for hite in removes_hit_effects:
+            self.current_hit_effects.remove(hite)
         
 if __name__ == "__main__":
     import argparse
