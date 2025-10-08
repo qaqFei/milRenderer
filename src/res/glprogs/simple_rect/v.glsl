@@ -5,7 +5,6 @@ in vec2 in_uv;
 uniform vec4 trans_abcd;
 uniform vec2 trans_ef;
 uniform vec2 viewport;
-out vec2 v_uv;
 
 vec2 transv2(vec2 p, vec2 scale) {
     p.y *= -1;
@@ -27,7 +26,5 @@ vec2 transv2(vec2 p, vec2 scale) {
 
 void main(){
     vec2 t_in_pos = transv2(in_pos, viewport);
-
     gl_Position = vec4(t_in_pos, 0.0, 1.0);
-    v_uv = in_uv;
 }

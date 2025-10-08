@@ -9,6 +9,7 @@ import io
 import json
 import struct
 import time
+import collections
 import ctypes
 from ctypes.util import find_library
 
@@ -788,10 +789,99 @@ def _export_audio(audio: np.ndarray, path: str) -> None:
         f.write(b"data")
         f.write(audio.tobytes())
 
-class GlProgManager:
+class _2DTransform:
+    def __init__(self, matrix: typing.Optional[tuple[float, float, float, float, float, float]] = None):
+        self.matrix = matrix if matrix is not None else (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+        self._states = collections.deque()
+    
+    def resetTransform(self):
+        self.matrix = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+        return self
+
+    def setTransform(self, a: float, b: float, c: float, d: float, e: float, f: float):
+        self.matrix = (a, b, c, d, e, f)
+        return self
+
+    def transform(self, a: float, b: float, c: float, d: float, e: float, f: float):
+        self.matrix = (
+            self.matrix[0] * a + self.matrix[2] * b,
+            self.matrix[1] * a + self.matrix[3] * b,
+            self.matrix[0] * c + self.matrix[2] * d,
+            self.matrix[1] * c + self.matrix[3] * d,
+            self.matrix[0] * e + self.matrix[2] * f + self.matrix[4],
+            self.matrix[1] * e + self.matrix[3] * f + self.matrix[5]
+        )
+        return self
+    
+    def scale(self, x: float, y: float):
+        self.transform(x, 0.0, 0.0, y, 0.0, 0.0)
+        return self
+    
+    def translate(self, x: float, y: float):
+        self.transform(1.0, 0.0, 0.0, 1.0, x, y)
+        return self
+    
+    def rotate(self, angle: float):
+        self.transform(math.cos(angle), math.sin(angle), -math.sin(angle), math.cos(angle), 0.0, 0.0)
+        return self
+    
+    def rotateDegree(self, angle: float):
+        self.rotate(angle * math.pi / 180.0)
+        return self
+    
+    def getPoint(self, x: float, y: float):
+        return (
+            self.matrix[0] * x + self.matrix[2] * y + self.matrix[4],
+            self.matrix[1] * x + self.matrix[3] * y + self.matrix[5]
+        )
+    
+    def getRectPoints(self, x: float, y: float, width: float, height: float):
+        return (
+            self.getPoint(x, y),
+            self.getPoint(x + width, y),
+            self.getPoint(x + width, y + height),
+            self.getPoint(x, y + height)
+        )
+    
+    def getCRectPoints(self, x: float, y: float, width: float, height: float):
+        x -= width / 2
+        y -= height / 2
+        return self.getRectPoints(x, y, width, height)
+    
+    def getInverse(self):
+        a, b, c, d, e, f = self.matrix
+        det = a * d - b * c
+        inv_det = 1.0 / det if det != 0.0 else 1e9
+        inv = (
+            d * inv_det,
+            -b * inv_det,
+            -c * inv_det,
+            a * inv_det,
+            (c * f - d * e) * inv_det,
+            (b * e - a * f) * inv_det
+        )
+        return _2DTransform(inv)
+    
+    def save():
+        self._states.append(self.matrix)
+    
+    def restore():
+        if self._states.empty():
+            return
+
+        self.matrix = self._states.pop()
+
+    def warp(self):
+        return type("_2DTransformWarp", (object, ), {
+            "__enter__": lambda *_: self.save(),
+            "__exit__": lambda *_: self.restore()
+        })
+
+class _GlProgManager:
     def __init__(self, ctx: moderngl.Context):
         self.ctx = ctx
         self.progs: dict[str, mgl.Program] = {}
+        self.trans = _2DTransform()
     
     def add_from_shader(self, name: str, vertex_shader: str, fragment_shader: str):
         prog = self.ctx.program(vertex_shader, fragment_shader)
@@ -811,35 +901,93 @@ class GlProgManager:
     def add_from_folder(self, name: str):
         self.add_from_file(name, f"./res/glprogs/{name}/v.glsl", f"./res/glprogs/{name}/f.glsl")
     
-    def p_simple_texture(self, tex: moderngl.Texture, x: float, y: float, w: float, h: float, u: flaot = 0.0, v: float = 0.0, uw: float = 1.0, vh: float = 1.0):
-        progn = "simple_texture"
-        prog = self.progs[progn]
+    def _set_v_uniforms(self, prog: mgl.Program):
+        prog["trans_abcd"].value = self.trans.matrix[:4]
+        prog["trans_ef"].value = self.trans.matrix[4:6]
+        prog["viewport"].value = self.ctx.viewport[2:4]
 
-        sw, sh = self.ctx.viewport[2:]
+    def _get_vs_typ(self, typ: list[tuple[str, type, int]]):
+        tns = []
+
+        for name, t, n in typ:
+            tns.append(str(n) + {
+                np.float32: "f",
+            }[t])
+        
+        return (" ".join(tns), *map(lambda x: x[0], typ))
+    
+    def _norm_xy(self, x: float, y: float, w: float, h: float):
+        sw, sh = self.ctx.viewport[2:4]
         x1 = (x / sw) * 2 - 1
         y1 = 1 - (y / sh) * 2
         x2 = ((x + w) / sw) * 2 - 1
         y2 = 1 - ((y + h) / sh) * 2
+        return x1, y1, x2, y2
 
-        quad = np.array([
-            x1, y2, u, v + vh,
-            x2, y2, u + uw, v + vh,
-            x1, y1, u, v,
-            x2, y1, u + uw, v,
-        ], dtype=np.float32)
+    def p_simple_texture(self, tex: moderngl.Texture, x: float, y: float, w: float, h: float, u: flaot = 0.0, v: float = 0.0, uw: float = 1.0, vh: float = 1.0):
+        progn = "simple_texture"
+        prog = self.progs[progn]
 
-        vertices = self.ctx.buffer(quad.tobytes())
+        dtyp = [
+            ("in_pos", np.float32, 2),
+            ("in_uv", np.float32, 2),
+        ]
+
+        x1, y1, x2, y2 = self._norm_xy(x, y, w, h)
+
+        vsbytes = np.array([
+            ((x1, y2), (u, v + vh),),
+            ((x2, y2), (u + uw, v + vh),),
+            ((x1, y1), (u, v),),
+            ((x2, y1), (u + uw, v),),
+        ], dtype=dtyp).tobytes()
+
+        vertices = self.ctx.buffer(vsbytes)
         ibo = self.ctx.buffer(np.array([0, 1, 2, 1, 3, 2], dtype=np.uint8).tobytes())
 
         vao = self.ctx.vertex_array(
             prog,
-            [(vertices, "2f 2f", "in_pos", "in_uv")],
+            [(vertices, *self._get_vs_typ(dtyp))],
             index_buffer=ibo,
             index_element_size=1
         )
 
         tex.use(location=0)
         prog["u_tex"].value = 0
+        self._set_v_uniforms(prog)
+
+        vao.render(mgl.TRIANGLES)
+    
+    def p_simple_rect(self, x: float, y: float, w: float, h: float, fill_color: typing.Iterable[float, float, float, float]):
+        progn = "simple_rect"
+        prog = self.progs[progn]
+
+        dtyp = [
+            ("in_pos", np.float32, 2),
+        ]
+
+        x1, y1, x2, y2 = self._norm_xy(x, y, w, h)
+
+        u, v, uw, vh = 0, 0, 1, 1
+        vsbytes = np.array([
+            ((x1, y2), ),
+            ((x2, y2), ),
+            ((x1, y1), ),
+            ((x2, y1), ),
+        ], dtype=dtyp).tobytes()
+
+        vertices = self.ctx.buffer(vsbytes)
+        ibo = self.ctx.buffer(np.array([0, 1, 2, 1, 3, 2], dtype=np.uint8).tobytes())
+
+        vao = self.ctx.vertex_array(
+            prog,
+            [(vertices, *self._get_vs_typ(dtyp))],
+            index_buffer=ibo,
+            index_element_size=1
+        )
+
+        prog["u_fill_color"].value = fill_color
+        self._set_v_uniforms(prog)
 
         vao.render(mgl.TRIANGLES)
 
@@ -907,6 +1055,9 @@ class MilRenderer:
                 logger.info("created rendering context with egl backend")
             else:
                 raise RuntimeError("Failed to create rendering context") from e
+        
+        self.ctx.enable(mgl.BLEND)
+        self.ctx.blend_func = (mgl.SRC_ALPHA, mgl.ONE_MINUS_SRC_ALPHA, mgl.ONE, mgl.ONE)
 
         logger.info("created rendering context")
         logger.debug(f"rendering context info: {self.ctx.info}")
@@ -963,8 +1114,9 @@ class MilRenderer:
         self.resloader = MilResourceLoader(self.ctx)
 
         logger.info("loading gl programs")
-        self.glpman = GlProgManager(self.ctx)
+        self.glpman = _GlProgManager(self.ctx)
         self.glpman.add_from_folder("simple_texture")
+        self.glpman.add_from_folder("simple_rect")
 
         self._initialized = True
     
@@ -1074,7 +1226,17 @@ class MilRenderer:
             raise RuntimeError(f"Failed to close output stream: {e}") from e
     
     def _render_chart(self, chart: MilChart, t: float, cres: _MilChartRes):
-        self.glpman.p_simple_texture(cres.imageTex, 0, 0, 500, 500)
+        w, h = self.cfg.width, self.cfg.height
+        scr_ratio = w / h
+        bg_ratio = cres.imageTex.width / cres.imageTex.height
+
+        if scr_ratio > bg_ratio:
+            bg_size = (self.cfg.width, self.cfg.height * bg_ratio / scr_ratio)
+        else:
+            bg_size = (self.cfg.width * scr_ratio / bg_ratio, self.cfg.height)
+        
+        self.glpman.p_simple_texture(cres.imageTex, bg_size[0] / 2 - w / 2, bg_size[1] / 2 - h / 2, *bg_size)
+        self.glpman.p_simple_rect(0, 0, w, h / 3, (0, 0, 0, chart.meta.background_dim))
         
 if __name__ == "__main__":
     import argparse
