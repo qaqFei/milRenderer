@@ -1057,7 +1057,7 @@ class MilRenderer:
                 raise RuntimeError("Failed to create rendering context") from e
         
         self.ctx.enable(mgl.BLEND)
-        self.ctx.blend_func = (mgl.SRC_ALPHA, mgl.ONE_MINUS_SRC_ALPHA, mgl.ONE, mgl.ONE)
+        self.ctx.blend_func = (mgl.SRC_ALPHA, mgl.ONE_MINUS_SRC_ALPHA, mgl.SRC_ALPHA, mgl.ONE_MINUS_SRC_ALPHA)
 
         logger.info("created rendering context")
         logger.debug(f"rendering context info: {self.ctx.info}")
