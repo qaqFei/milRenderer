@@ -159,47 +159,28 @@ void ReleaseVideoContext(VideoContext* ctx) {
     avcodec_free_context(&ctx->codecCtx);
     av_frame_free(&ctx->frame);
     av_packet_free(&ctx->packet);
-    sws_freeContext(ctx->swsCtx);
     avformat_free_context(fmt);
 
     ctx->formatCtx = nullptr;
     ctx->codecCtx = nullptr;
     ctx->frame = nullptr;
     ctx->packet = nullptr;
-    ctx->swsCtx = nullptr;
 }
 
 void PutFrame(VideoContext* ctx, iu8* rgbBuffer, i64 width, i64 height) {
-    i64 pxCount = width * height;
-
-    if (!ctx->swsCtx) {
-        ctx->swsCtx = sws_getContext(
-            width, height, AV_PIX_FMT_RGB24,
-            width, height, AV_PIX_FMT_YUV420P,
-            SWS_POINT, nullptr, nullptr, nullptr
-        );
-    }
-
-    AVFrame* rgbFrame = av_frame_alloc();
-    av_image_alloc(rgbFrame->data, rgbFrame->linesize, width, height, AV_PIX_FMT_RGB24, 1);
-
-    for (int y = 0; y < height; ++y) {
-        memcpy(rgbFrame->data[0] + y * rgbFrame->linesize[0], rgbBuffer + y * width * 3, width * 3);
-    }
-
+    iu8* rgbLastLine = rgbBuffer + (height - 1) * width * 3;
     libyuv::RGB24ToI420(
-        rgbBuffer, width * 3,
+        rgbLastLine, -width * 3,
         ctx->frame->data[0], ctx->frame->linesize[0],
         ctx->frame->data[1], ctx->frame->linesize[1],
         ctx->frame->data[2], ctx->frame->linesize[2],
         width, height
     );
-    // sws_scale(ctx->swsCtx, (const iu8* const*)rgbFrame->data, rgbFrame->linesize, 0, height, ctx->frame->data, ctx->frame->linesize);
 
     ctx->frame->pts = ctx->frameIndex++;
 
     int ret = avcodec_send_frame(ctx->codecCtx, ctx->frame);
-    if (ret < 0) goto END;
+    if (ret < 0) return;
 
     while (ret >= 0) {
         ret = avcodec_receive_packet(ctx->codecCtx, ctx->packet);
@@ -208,10 +189,6 @@ void PutFrame(VideoContext* ctx, iu8* rgbBuffer, i64 width, i64 height) {
         av_interleaved_write_frame(ctx->formatCtx, ctx->packet);
         av_packet_unref(ctx->packet);
     }
-
-END:
-    av_freep(&rgbFrame->data[0]);
-    av_frame_free(&rgbFrame);
 }
 
 char* GetEncoders(bool isVideo) {

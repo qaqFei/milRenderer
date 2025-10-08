@@ -27,7 +27,6 @@ struct VideoContext {
     AVStream* stream;
     AVFrame* frame;
     AVPacket* packet;
-    SwsContext* swsCtx;
     i32 frameIndex;
 
     bool hasAudio;

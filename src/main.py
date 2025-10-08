@@ -704,7 +704,20 @@ def _decodeImageBytes(data: bytes) -> WarppedImage:
     with av.open(warpped) as cont:
         for frame in cont.decode(video=0):
             frame.pts = None
-            return WarppedImage(frame.to_ndarray(), frame.format.bits_per_pixel == 32)
+            narr = frame.to_ndarray()
+            c = frame.format.bits_per_pixel // 8
+            h, w = narr.shape[:2]
+
+            if c == 4:
+                narr = narr.ravel()
+                r, b = np.arange(len(narr)) % 4 == 0, np.arange(len(narr)) % 4 == 2
+                narr[r], narr[b] = narr[b], narr[r]
+            elif c == 3:
+                narr = narr[:, :, ::-1].ravel()
+            else:
+                raise ValueError(f"Unsupported color depth: {c}")
+
+            return WarppedImage(narr, w, h, c)
         else:
             raise ValueError("No frame found")
 
@@ -713,10 +726,13 @@ def _decodeImageFromFile(path: str) -> WarppedImage:
         return _decodeImageBytes(f.read())
 
 def _loadGlTexture(ctx: mgl.Context, raw: WarppedImage):
+    data = raw.data.tobytes()
+
     return ctx.texture(
-        size = raw.data.shape[:2],
-        components = raw.data.shape[2],
-        data = raw.data.tobytes()
+        size = (raw.width, raw.height),
+        components = raw.c,
+        data = data,
+        dtype = "u1"
     )
 
 def _loadGlTextureFromFile(ctx: mgl.Context, path: str):
@@ -776,9 +792,6 @@ class GlProgManager:
     def __init__(self, ctx: moderngl.Context):
         self.ctx = ctx
         self.progs: dict[str, mgl.Program] = {}
-        self.verts = np.zeros(65536, dtype=[("pos", np.float32, 2), ("uv", np.float32, 2)])
-        self.vbo = self.ctx.buffer(self.verts)
-        self.vaos: dict[str, moderngl.VertexArray] = {}
     
     def add_from_shader(self, name: str, vertex_shader: str, fragment_shader: str):
         prog = self.ctx.program(vertex_shader, fragment_shader)
@@ -800,33 +813,36 @@ class GlProgManager:
     
     def p_simple_texture(self, tex: moderngl.Texture, x: float, y: float, w: float, h: float):
         progn = "simple_texture"
-        prog = self[progn]
+        prog = self.progs[progn]
 
-        if progn not in self.vaos:
-            vao = self.ctx.vertex_array(prog, [(self.vbo, "2f 2f", "a_pos", "a_uv")])
-            self.vaos[progn] = vao
-        else:
-            vao = self.vaos[progn]
+        sw, sh = self.ctx.viewport[2:]
+        x1 = (x / sw) * 2 - 1
+        y1 = 1 - (y / sh) * 2
+        x2 = ((x + w) / sw) * 2 - 1
+        y2 = 1 - ((y + h) / sh) * 2
 
-        x1, y1 = x, y
-        x2, y2 = x + w, y + h
-        vs = np.array([
-            ((x1, y1), (0, 0)),
-            ((x2, y1), (1, 0)),
-            ((x2, y2), (1, 1)),
-            ((x1, y1), (0, 0)),
-            ((x2, y2), (1, 1)),
-            ((x1, y2), (0, 1)),
-        ], dtype=[("pos", "2f"), ("uv", "2f")])
+        quad = np.array([
+            x1,  y2,  0.0, 1.0,
+            x2,  y2,  1.0, 1.0,
+            x1,  y1,  0.0, 0.0,
+            x2,  y1,  1.0, 0.0,
+        ], dtype=np.float32)
 
-        self.vbo.write(vs.tobytes())
+        vertices = self.ctx.buffer(quad.tobytes())
+        ibo = self.ctx.buffer(np.array([0, 1, 2, 1, 3, 2], dtype='u1').tobytes())
 
-        prog["u_tex"] = 0
-        tex.use(0)
-        prog["u_vp"] = self.ctx.viewport[2:]
+        vao = self.ctx.vertex_array(
+            prog,
+            [(vertices, "2f 2f", "in_pos", "in_uv")],
+            index_buffer=ibo,
+            index_element_size=1
+        )
 
-        vao.render(mgl.TRIANGLES, first=0, vertices=6)
-    
+        tex.use(location=0)
+        prog["u_tex"].value = 0
+
+        vao.render(mgl.TRIANGLES)
+
     def __getitem__(self, name: str):
         return self.progs[name]
         
@@ -839,7 +855,9 @@ class GlProgManager:
 @dataclasses.dataclass
 class WarppedImage:
     data: np.ndarray
-    alpha: bool
+    width: int
+    height: int
+    c: int
 
 class MilResourceLoader:
     def __init__(self, ctx: mgl.Context):
@@ -1070,8 +1088,11 @@ if __name__ == "__main__":
     aparser.add_argument("-y", "--yes", action="store_true", default=False)
     aparser.add_argument("-vc", "--video-codec", type=str, default="libx264")
     aparser.add_argument("-ac", "--audio-codec", type=str, default="aac")
+    aparser.add_argument("-as", "--audio-sample-rate", type=int, default=44100)
 
     args = aparser.parse_args()
+
+    AUDIO_SAMPLE_RATE = args.audio_sample_rate
 
     if os.path.isfile(args.output):
         if not args.yes and input(f"{args.output} is exists, are you sure to continue? [y/N] ").lower() != "y":
