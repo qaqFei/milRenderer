@@ -811,7 +811,7 @@ class GlProgManager:
     def add_from_folder(self, name: str):
         self.add_from_file(name, f"./res/glprogs/{name}/v.glsl", f"./res/glprogs/{name}/f.glsl")
     
-    def p_simple_texture(self, tex: moderngl.Texture, x: float, y: float, w: float, h: float):
+    def p_simple_texture(self, tex: moderngl.Texture, x: float, y: float, w: float, h: float, u: flaot = 0.0, v: float = 0.0, vw: float = 1.0, vh: float = 1.0):
         progn = "simple_texture"
         prog = self.progs[progn]
 
@@ -820,16 +820,20 @@ class GlProgManager:
         y1 = 1 - (y / sh) * 2
         x2 = ((x + w) / sw) * 2 - 1
         y2 = 1 - ((y + h) / sh) * 2
+        u1 = u / tex.width
+        v1 = 1 - v / tex.height
+        u2 = (u + vw) / tex.width
+        v2 = 1 - (v + vh) / tex.height
 
         quad = np.array([
-            x1,  y2,  0.0, 1.0,
-            x2,  y2,  1.0, 1.0,
-            x1,  y1,  0.0, 0.0,
-            x2,  y1,  1.0, 0.0,
+            x1, y2, u1, v2,
+            x2, y2, u2, v2,
+            x1, y1, u1, v1,
+            x2, y1, u2, v1
         ], dtype=np.float32)
 
         vertices = self.ctx.buffer(quad.tobytes())
-        ibo = self.ctx.buffer(np.array([0, 1, 2, 1, 3, 2], dtype='u1').tobytes())
+        ibo = self.ctx.buffer(np.array([0, 1, 2, 1, 3, 2], dtype=np.uint8).tobytes())
 
         vao = self.ctx.vertex_array(
             prog,
