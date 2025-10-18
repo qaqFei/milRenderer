@@ -1,2 +1,2 @@
 g++ -o main main.cpp \
-    -lzip
+    -lzip -lavformat -lavcodec -lavutil -lswresample
